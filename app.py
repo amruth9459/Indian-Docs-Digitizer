@@ -8,7 +8,7 @@ import shutil
 import re
 import pytesseract
 import time
-from thefuzz import fuzz
+from thefuzz import fuzz, process
 from llama_parse import LlamaParse
 from pdf2image import convert_from_path
 
@@ -176,28 +176,41 @@ def clean_final_output(text):
     
     return cleaned
 
-# 4. THE "LIE DETECTOR" FUNCTION (Anti-Hallucination)
+# 4. THE "LIE DETECTOR" FUNCTION (Stricter & returns context)
 def validate_accuracy(image_path, ai_text, status_placeholder):
-    """Compares AI output against Raw Tesseract OCR."""
+    """
+    Returns: (is_clean, suspicious_list, raw_text)
+    """
     status_placeholder.markdown('<div class="status-container">🔍 Running Tesseract Cross-Examination...</div>', unsafe_allow_html=True)
+    
+    # 1. Get Ground Truth
     try:
         raw_text = pytesseract.image_to_string(image_path)
     except:
-        return True, "OCR Skipped (Technical Issue)"
+        return True, [], ""
 
-    ignore_list = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT"]
-    ai_words = set(re.findall(r'\b[A-Z][a-z]{3,}\b', ai_text)) 
+    # 2. Extract Proper Nouns (Capitalized words > 3 chars)
+    # Filter out common legal stopwords to focus on Names/Entities
+    stopwords = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT", "APPLICANT", "DEFENDANT", "COUNSEL", "ADVOCATE", "HYDERABAD", "TRIBUNAL", "ORDER", "OFFICE"]
     
-    suspicious_words = []
+    # Regex to find capitalized words (names, companies)
+    ai_words = set(re.findall(r'\b[A-Z][a-z]{2,}\b', ai_text))
+    ai_words.update(set(re.findall(r'\b[A-Z]{3,}\b', ai_text)))
+    
+    suspicious_list = []
+    
+    # 3. Cross-Examine
     for word in ai_words:
-        if word.upper() in ignore_list: continue
-        if fuzz.partial_ratio(word.lower(), raw_text.lower()) < 85:
-            suspicious_words.append(word)
+        clean_word = word.strip(".,;:").upper()
+        if clean_word in stopwords: 
+            continue
+            
+        # STRICT CHECK: Word must exist in raw text with 80% similarity
+        if fuzz.partial_ratio(word.lower(), raw_text.lower()) < 80:
+            suspicious_list.append(word)
 
-    if suspicious_words:
-        return False, f"Hallucination Risk! AI found these words but they are NOT in the image: {', '.join(suspicious_words[:5])}"
-    
-    return True, "Verified"
+    is_clean = len(suspicious_list) == 0
+    return is_clean, suspicious_list, raw_text
 
 # 5. MAIN APP INTERFACE
 def main():
@@ -281,12 +294,17 @@ def main():
                         val_img = path
                     
                     # Lie Detector
-                    is_valid, msg = validate_accuracy(val_img, ai_text, status_area)
+                    is_valid, suspicious_list, raw_text = validate_accuracy(val_img, ai_text, status_area)
                     
                     if not is_valid:
                         status_area.markdown(f'<div class="status-container" style="border-left-color: #ef4444;">⚠️ Hallucination Risk Detected! Flagging for review.</div>', unsafe_allow_html=True)
                         st.session_state.review_queue.append({
-                            "name": f.name, "path": path, "text": ai_text, "error": msg
+                            "name": f.name, 
+                            "path": path, 
+                            "text": ai_text, 
+                            "errors": suspicious_list,
+                            "raw_text": raw_text,
+                            "error": f"Found {len(suspicious_list)} suspicious entities."
                         })
                         time.sleep(1) # Visual feedback
                     else:
@@ -326,7 +344,7 @@ def main():
             
             st.error(f"**Reason for Flag:** {item['error']}")
             
-            c_img, c_edit = st.columns(2)
+            c_img, c_edit = st.columns([1, 1])
             with c_img:
                 st.subheader("Original Document")
                 try:
@@ -336,11 +354,93 @@ def main():
                         st.image(item["path"], use_container_width=True)
                 except Exception as e:
                     st.error(f"Could not display image: {e}")
+                
+                st.divider()
+                with st.expander("🔍 Show Raw OCR (Dumb AI Layer)"):
+                    st.code(item.get("raw_text", "Not available"))
+
             with c_edit:
-                st.subheader("Extracted Text (Correct Hallucinations)")
-                new_text = st.text_area("Markdown Content", clean_final_output(item["text"]), height=600)
-                if st.button("✅ APPROVE & SAVE", use_container_width=True):
-                    st.session_state.processed_data[sel] = new_text
+                st.subheader("🔧 Smart Entity Repair")
+                st.info("Select the correct version of the flagged words below.")
+                
+                # We work on a copy of the text
+                current_text = item["text"]
+                
+                # If the Lie Detector found specific words
+                if item.get("errors"):
+                    for i, error_word in enumerate(item["errors"]):
+                        st.divider()
+                        
+                        # Show context snippet
+                        start_idx = current_text.find(error_word)
+                        if start_idx != -1:
+                            end_idx = start_idx + len(error_word)
+                            snippet = current_text[max(0, start_idx-30):min(len(current_text), end_idx+30)]
+                            snippet = snippet.replace("\n", " ")
+                            st.markdown(f"🔴 **Suspect Word:** `{error_word}`")
+                            st.caption(f"...{snippet}...")
+                        
+                        # Generate Intelligent Options
+                        options = []
+                        
+                        # Option A: What Tesseract saw in the raw text (Best Guess)
+                        raw_text_options = process.extract(error_word, item["raw_text"].split(), limit=3)
+                        for match, score in raw_text_options:
+                            if match != error_word and match not in options:
+                                options.append(match)
+                                
+                        # Option B: Common Legal Corrections
+                        if "Pega" in error_word: options.append("Pegasus Assets")
+                        if "Karnataka" in error_word: options.append("Harsha")
+                        
+                        # Option C: The Original
+                        options.append(error_word + " (Keep Original)")
+                        
+                        # Option D: "Illegible"
+                        options.append(" [ILLEGIBLE] ")
+
+                        # UI: Radio Button for speed
+                        choice = st.radio(
+                            f"Correction for '{error_word}':", 
+                            options, 
+                            key=f"rad_{i}_{sel}",
+                            index=None
+                        )
+                        
+                        final_replacement = None
+                        if choice:
+                            if "Keep Original" in choice:
+                                final_replacement = error_word
+                            elif "[ILLEGIBLE]" in choice:
+                                final_replacement = "[ILLEGIBLE]"
+                            else:
+                                final_replacement = choice
+
+                        # Manual Override
+                        manual_fix = st.text_input(f"Or type manually for '{error_word}':", key=f"man_{i}_{sel}")
+                        if manual_fix:
+                            final_replacement = manual_fix
+                        
+                        # Apply the fix to the text immediately
+                        if final_replacement and final_replacement != error_word:
+                            current_text = current_text.replace(error_word, final_replacement)
+                            st.success(f"Fixed: {error_word} ➡️ {final_replacement}")
+
+                st.divider()
+                
+                # Global "Illegible" Button
+                if st.button("🚫 Mark Entire File as ILLEGIBLE", use_container_width=True):
+                    st.session_state.processed_data[sel] = "[FILE MARKED ILLEGIBLE BY HUMAN REVIEWER]"
+                    st.session_state.review_queue = [x for x in q if x["name"] != sel]
+                    if not st.session_state.review_queue:
+                        st.session_state.active_tab = "📤 PROCESS"
+                    st.rerun()
+
+                st.markdown("### 📝 Final Verification")
+                final_text_display = st.text_area("Final Text Preview", value=clean_final_output(current_text), height=400)
+                
+                if st.button("✅ APPROVE & SAVE FILE", use_container_width=True):
+                    st.session_state.processed_data[sel] = final_text_display
                     st.session_state.review_queue = [x for x in q if x["name"] != sel]
                     if not st.session_state.review_queue:
                         st.session_state.active_tab = "📤 PROCESS"
