@@ -7,10 +7,12 @@ import nest_asyncio
 import shutil
 import re
 import pytesseract
+from pytesseract import Output
 import time
 from thefuzz import fuzz, process
 from llama_parse import LlamaParse
 from pdf2image import convert_from_path
+from PIL import Image, ImageDraw
 
 # 1. SYSTEM SETUP
 nest_asyncio.apply()
@@ -176,24 +178,23 @@ def clean_final_output(text):
     
     return cleaned
 
-# 4. THE "LIE DETECTOR" FUNCTION (Stricter & returns context)
-def validate_accuracy(image_path, ai_text, status_placeholder):
+# 4. THE "LIE DETECTOR" FUNCTION (With Coordinates)
+def validate_with_coordinates(image_path, ai_text, status_placeholder):
     """
-    Returns: (is_clean, suspicious_list, raw_text)
+    Returns: (is_clean, suspicious_list, raw_text, ocr_data)
     """
     status_placeholder.markdown('<div class="status-container">🔍 Running Tesseract Cross-Examination...</div>', unsafe_allow_html=True)
     
-    # 1. Get Ground Truth
+    # 1. Get Ground Truth with Coordinates
     try:
-        raw_text = pytesseract.image_to_string(image_path)
+        ocr_data = pytesseract.image_to_data(image_path, output_type=Output.DICT)
+        raw_text = " ".join([w for w in ocr_data['text'] if w.strip() != ""])
     except:
-        return True, [], ""
+        return True, [], "", {}
 
     # 2. Extract Proper Nouns (Capitalized words > 3 chars)
-    # Filter out common legal stopwords to focus on Names/Entities
     stopwords = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT", "APPLICANT", "DEFENDANT", "COUNSEL", "ADVOCATE", "HYDERABAD", "TRIBUNAL", "ORDER", "OFFICE"]
     
-    # Regex to find capitalized words (names, companies)
     ai_words = set(re.findall(r'\b[A-Z][a-z]{2,}\b', ai_text))
     ai_words.update(set(re.findall(r'\b[A-Z]{3,}\b', ai_text)))
     
@@ -210,9 +211,38 @@ def validate_accuracy(image_path, ai_text, status_placeholder):
             suspicious_list.append(word)
 
     is_clean = len(suspicious_list) == 0
-    return is_clean, suspicious_list, raw_text
+    return is_clean, suspicious_list, raw_text, ocr_data
 
-# 5. MAIN APP INTERFACE
+# 5. HELPER: DRAW HIGHLIGHTS ON IMAGE
+def highlight_suspects(image_path, ocr_data, suspect_words):
+    """
+    Draws red boxes on the image where words resemble the suspect words.
+    """
+    try:
+        if isinstance(image_path, str):
+            img = Image.open(image_path).convert("RGB")
+        else:
+            img = image_path.convert("RGB") # Handle PDF page object
+            
+        draw = ImageDraw.Draw(img)
+        
+        n_boxes = len(ocr_data['text'])
+        for i in range(n_boxes):
+            word_on_page = ocr_data['text'][i].strip()
+            if not word_on_page: continue
+            
+            # Check if this word on page is similar to any suspect word
+            for suspect in suspect_words:
+                # If high similarity (e.g. AI: Pegasystems, Page: Pegasus), highlight it
+                if fuzz.ratio(suspect.lower(), word_on_page.lower()) > 60:
+                    (x, y, w, h) = (ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i])
+                    draw.rectangle([x, y, x + w, y + h], outline="red", width=4)
+                    
+        return img
+    except Exception as e:
+        return None
+
+# 6. MAIN APP INTERFACE
 def main():
     with st.sidebar:
         st.markdown("<h1 style='text-align: center; color: #3b82f6;'>⚙️ CONFIG</h1>", unsafe_allow_html=True)
@@ -293,8 +323,8 @@ def main():
                     else:
                         val_img = path
                     
-                    # Lie Detector
-                    is_valid, suspicious_list, raw_text = validate_accuracy(val_img, ai_text, status_area)
+                    # Lie Detector with Coordinates
+                    is_valid, suspicious_list, raw_text, ocr_data = validate_with_coordinates(val_img, ai_text, status_area)
                     
                     if not is_valid:
                         status_area.markdown(f'<div class="status-container" style="border-left-color: #ef4444;">⚠️ Hallucination Risk Detected! Flagging for review.</div>', unsafe_allow_html=True)
@@ -304,6 +334,7 @@ def main():
                             "text": ai_text, 
                             "errors": suspicious_list,
                             "raw_text": raw_text,
+                            "ocr_data": ocr_data,
                             "error": f"Found {len(suspicious_list)} suspicious entities."
                         })
                         time.sleep(1) # Visual feedback
@@ -346,12 +377,19 @@ def main():
             
             c_img, c_edit = st.columns([1, 1])
             with c_img:
-                st.subheader("Original Document")
+                st.subheader("🔴 Smart Highlight")
                 try:
                     if item["name"].lower().endswith(".pdf"):
-                        st.image(convert_from_path(item["path"], first_page=1, last_page=1)[0], use_container_width=True)
+                        base_img = convert_from_path(item["path"], first_page=1, last_page=1)[0]
                     else:
-                        st.image(item["path"], use_container_width=True)
+                        base_img = item["path"]
+                    
+                    highlighted_img = highlight_suspects(base_img, item["ocr_data"], item["errors"])
+                    
+                    if highlighted_img:
+                        st.image(highlighted_img, use_container_width=True, caption="Red boxes show detected text matches")
+                    else:
+                        st.error("Could not generate highlights")
                 except Exception as e:
                     st.error(f"Could not display image: {e}")
                 
@@ -384,8 +422,9 @@ def main():
                         options = []
                         
                         # Option A: What Tesseract saw in the raw text (Best Guess)
-                        raw_text_options = process.extract(error_word, item["raw_text"].split(), limit=3)
-                        for match, score in raw_text_options:
+                        raw_text_list = item["raw_text"].split()
+                        raw_matches = process.extract(error_word, raw_text_list, limit=3)
+                        for match, score in raw_matches:
                             if match != error_word and match not in options:
                                 options.append(match)
                                 
