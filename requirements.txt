@@ -1,6 +1,8 @@
 streamlit
 llama-parse
 nest_asyncio
-python-dotenv
 pdf2image
+python-dotenv
+pytesseract
+thefuzz
 pillow
