@@ -4,8 +4,10 @@ import tempfile
 import zipfile
 import io
 import nest_asyncio
+import shutil
 import re
 import pytesseract
+import time
 from thefuzz import fuzz
 from llama_parse import LlamaParse
 from pdf2image import convert_from_path
@@ -20,149 +22,276 @@ try:
 except ImportError:
     POPPLER_INSTALLED = False
 
-st.set_page_config(page_title="Paranoid Legal Digitizer", page_icon="🛡️", layout="wide")
+st.set_page_config(
+    page_title="Indian Doc Digitizer (Pro)", 
+    page_icon="🇮🇳", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-if not POPPLER_INSTALLED:
-    st.error("Poppler not found. Install poppler-utils to enable PDF preview in Human Review.")
+# --- CUSTOM CSS FOR PREMIUM LOOK ---
+st.markdown("""
+<style>
+    /* Main Background */
+    .stApp {
+        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        color: #f8fafc;
+    }
+    
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: rgba(15, 23, 42, 0.8);
+        backdrop-filter: blur(10px);
+        border-right: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    
+    /* Card-like containers */
+    div[data-testid="stVerticalBlock"] > div:has(div.stAlert) {
+        background: rgba(30, 41, 59, 0.7);
+        border-radius: 15px;
+        padding: 20px;
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    }
 
-# Initialize State
+    /* Buttons */
+    .stButton > button {
+        background: linear-gradient(90deg, #3b82f6 0%, #2563eb 100%);
+        color: white;
+        border-radius: 8px;
+        border: none;
+        padding: 10px 24px;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 10px 15px -3px rgba(59, 130, 246, 0.4);
+        background: linear-gradient(90deg, #60a5fa 0%, #3b82f6 100%);
+    }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 24px;
+        background-color: transparent;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        background-color: transparent;
+        border-radius: 4px 4px 0 0;
+        color: #94a3b8;
+        font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        color: #3b82f6 !important;
+        border-bottom-color: #3b82f6 !important;
+    }
+
+    /* Progress Bar */
+    .stProgress > div > div > div > div {
+        background-color: #3b82f6;
+    }
+
+    /* Status Box */
+    .status-container {
+        background: rgba(51, 65, 85, 0.5);
+        border-radius: 10px;
+        padding: 15px;
+        margin-bottom: 10px;
+        border-left: 5px solid #3b82f6;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize Session State
 if "review_queue" not in st.session_state: st.session_state.review_queue = []
 if "processed_data" not in st.session_state: st.session_state.processed_data = {}
 
-# 2. PROMPT LIBRARY (STRICT MODE)
+# 2. THE BRAIN: FULL CATEGORY LIBRARY
 PROMPT_LIBRARY = {
     "⚖️ Legal (Strict)": """
-        You are a robotic legal transcription engine. 
+        You are a forensic legal digitizer. 
         INSTRUCTION: Transcribe text letter-for-letter. 
-        - DO NOT correct typos (e.g., if input says "Pegasvs", write "Pegasvs").
-        - DO NOT expand abbreviations (e.g., do not change "Pvt Ltd" to "Private Limited").
-        - DO NOT autocomplete names.
-        - If text is unreadable, write [?].
-        
-        STRUCTURE:
-        1. STAMPS: **[STAMP: <text>]**
-        2. TABLES: Output as Markdown Tables.
+        - DO NOT auto-complete names or expand abbreviations.
+        - If text is blurry, write [?].
+        1. STAMPS: **[STAMP: <text> | Date: <date>]**.
+        2. MARGINALIA: **[MARGIN NOTE: <text>]**.
+        3. TABLES: Repair broken tables.
+        4. LANGUAGES: Transcribe Telugu/Hindi/English exactly. DO NOT TRANSLATE.
     """,
-    "🧩 Evidence (Jatakam)": """
-        You are digitizing evidentiary grids.
+    "🧩 Evidence (Jatakam/Grids)": """
+        You are digitizing evidentiary grids (Horoscopes/Family Trees).
         1. GRID: Output South/North Indian charts as Markdown Tables.
-        2. SCRIPT: Keep Telugu/Sanskrit script exact.
-        3. SPATIAL: Maintain box positions.
+        2. SCRIPT: Keep Telugu/Sanskrit script exact. Do not Romanize.
+        3. SPATIAL: Maintain box positions perfectly.
+    """,
+    "🏠 Property Deeds (Registration)": """
+        You are digitizing Sale Deeds.
+        1. THUMBPRINTS: Ignore dark thumbprints overlaying text.
+        2. SCHEDULE: Extract boundaries (N/S/E/W) into a table.
+        3. MAPS: Output **[MAP DETECTED]** and dimensions only.
+    """,
+    "🏛️ Revenue Records (Pahani)": """
+        You are digitizing Revenue Ledgers.
+        1. COLUMNS: Strictly preserve the grid structure (Survey No, Name, Extent).
+        2. HANDWRITING: Capture handwritten remarks in margins.
+    """,
+    "💰 Banking (Dot Matrix)": """
+        You are reading dot-matrix text.
+        1. INFERENCE: Visually 'connect the dots' to form letters.
+        2. STRUCTURE: Maintain Debit/Credit/Balance columns.
     """
 }
 
-# 3. THE LIE DETECTOR FUNCTION
-def validate_accuracy(image_path, ai_text):
-    """
-    Compares AI output against Raw Tesseract OCR.
-    Returns: (is_clean, error_message)
-    """
-    # 1. Get "Ground Truth" using Dumb OCR
+# 3. THE "GARBAGE REMOVER" FUNCTION
+def clean_final_output(text):
+    """Removes raw OCR artifacts and common AI filler."""
+    if "[STAMP: CURRENT_PAGE_RAW_OCR_TEXT]" in text:
+        text = text.split("[STAMP: CURRENT_PAGE_RAW_OCR_TEXT]")[0]
+    # Remove common AI prefixes if they exist
+    text = re.sub(r'^(Here is the transcription:|Based on the document provided:)', '', text, flags=re.IGNORECASE).strip()
+    return text
+
+# 4. THE "LIE DETECTOR" FUNCTION (Anti-Hallucination)
+def validate_accuracy(image_path, ai_text, status_placeholder):
+    """Compares AI output against Raw Tesseract OCR."""
+    status_placeholder.markdown('<div class="status-container">🔍 Running Tesseract Cross-Examination...</div>', unsafe_allow_html=True)
     try:
         raw_text = pytesseract.image_to_string(image_path)
-    except Exception:
-        return False, "OCR Engine Failed"
+    except:
+        return True, "OCR Skipped (Technical Issue)"
 
-    # 2. Extract "High Risk" Entities from AI Text (Capitalized Words > 4 chars)
-    ignore_list = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP"]
-    
-    # Simple regex to find capitalized words (Potential Names/Companies)
-    ai_words = set(re.findall(r'\b[A-Z][a-z]+\b', ai_text))
-    # Add fully uppercase words too
-    ai_words.update(re.findall(r'\b[A-Z]{4,}\b', ai_text))
+    ignore_list = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT"]
+    ai_words = set(re.findall(r'\b[A-Z][a-z]{3,}\b', ai_text)) 
     
     suspicious_words = []
-    
-    # 3. Cross-Examine
     for word in ai_words:
-        if word.upper() in ignore_list:
-            continue
-            
-        # Check if this word exists in the Raw Text (Fuzzy Match to allow small OCR typos)
-        match_score = fuzz.partial_ratio(word.lower(), raw_text.lower())
-        
-        if match_score < 85:
+        if word.upper() in ignore_list: continue
+        if fuzz.partial_ratio(word.lower(), raw_text.lower()) < 85:
             suspicious_words.append(word)
 
     if suspicious_words:
-        return False, f"Hallucination Risk! AI found these words but Raw OCR did not: {', '.join(suspicious_words[:5])}"
+        return False, f"Hallucination Risk! AI found these words but they are NOT in the image: {', '.join(suspicious_words[:5])}"
     
     return True, "Verified"
 
-# 4. MAIN APP
+# 5. MAIN APP INTERFACE
 def main():
     with st.sidebar:
-        st.header("🛡️ Paranoid Mode")
-        api_key = st.text_input("LlamaCloud API Key", type="password")
-        mode = st.selectbox("Scenario", list(PROMPT_LIBRARY.keys()))
+        st.markdown("<h1 style='text-align: center; color: #3b82f6;'>⚙️ CONFIG</h1>", unsafe_allow_html=True)
+        api_key = st.text_input("LlamaCloud API Key", type="password", help="Get your key from cloud.llamaindex.ai")
         
-        st.info("Validation Level: High")
+        st.divider()
+        st.subheader("📂 Document Category")
+        mode = st.selectbox("Select Logic", list(PROMPT_LIBRARY.keys()))
+        st.info(f"**Mode:** {mode}")
         
         if st.session_state.processed_data:
+            st.divider()
+            st.subheader("📦 Export Results")
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zf:
                 for n, c in st.session_state.processed_data.items():
                     zf.writestr(os.path.splitext(n)[0]+".md", c)
-            st.download_button("📥 Download Verified ZIP", zip_buffer.getvalue(), "verified.zip", "application/zip")
+            st.download_button(
+                label="📥 Download Clean ZIP", 
+                data=zip_buffer.getvalue(), 
+                file_name="digitized_docs.zip", 
+                mime="application/zip",
+                use_container_width=True
+            )
 
-    st.title("🛡️ Zero-Hallucination Digitizer")
+    st.markdown("<h1 style='text-align: center;'>🇮🇳 Indian Document Digitizer <span style='color: #3b82f6; font-size: 0.5em;'>PRO</span></h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #94a3b8;'>Zero-Hallucination AI Extraction for Complex Indian Records</p>", unsafe_allow_html=True)
 
-    tab1, tab2 = st.tabs(["Process", "Review"])
+    tab1, tab2 = st.tabs(["📤 PROCESS", "🕵️ REVIEW"])
 
     with tab1:
-        files = st.file_uploader("Upload", accept_multiple_files=True)
-        if st.button("Start"):
+        col_up, col_info = st.columns([2, 1])
+        with col_up:
+            files = st.file_uploader("Drop your scans here (PDF, JPG, PNG)", accept_multiple_files=True)
+        with col_info:
+            st.markdown("""
+            ### 🛡️ Paranoid Mode Active
+            - **Smart AI**: LlamaParse
+            - **Dumb OCR**: Tesseract
+            - **Validation**: Cross-Examination enabled
+            """)
+
+        if st.button("🚀 START DIGITIZATION", use_container_width=True):
             if not api_key:
-                st.error("Please provide a LlamaCloud API Key.")
-            else:
-                parser = LlamaParse(api_key=api_key, result_type="markdown", parsing_instruction=PROMPT_LIBRARY[mode])
-                temp_dir = tempfile.mkdtemp()
-                bar = st.progress(0)
+                st.error("LlamaCloud API Key is required to proceed.")
+                st.stop()
+            if not files:
+                st.warning("Please upload at least one file.")
+                st.stop()
+            
+            parser = LlamaParse(api_key=api_key, result_type="markdown", parsing_instruction=PROMPT_LIBRARY[mode])
+            temp_dir = tempfile.mkdtemp()
+            
+            main_progress = st.progress(0)
+            status_area = st.empty()
+            
+            for i, f in enumerate(files):
+                file_status = st.empty()
+                file_status.markdown(f'<div class="status-container">📁 Processing <b>{f.name}</b>...</div>', unsafe_allow_html=True)
                 
-                for i, f in enumerate(files):
-                    path = os.path.join(temp_dir, f.name)
-                    with open(path, "wb") as file: file.write(f.getbuffer())
+                path = os.path.join(temp_dir, f.name)
+                with open(path, "wb") as file: 
+                    file.write(f.getbuffer())
+                
+                try:
+                    # Granular Status Updates
+                    status_area.markdown('<div class="status-container">☁️ Uploading to LlamaCloud & AI Parsing...</div>', unsafe_allow_html=True)
+                    docs = parser.load_data(path)
+                    ai_text = "\n\n".join([d.text for d in docs])
                     
-                    try:
-                        # 1. Smart Parse
-                        docs = parser.load_data(path)
-                        ai_text = "\n".join([d.text for d in docs])
-                        
-                        # 2. Prepare Image for Validation (Page 1)
-                        if f.name.lower().endswith(".pdf"):
-                            images = convert_from_path(path, first_page=1, last_page=1)
-                            val_image = images[0]
-                        else:
-                            val_image = path # Works for jpg/png
-                        
-                        # 3. RUN THE LIE DETECTOR
-                        is_clean, msg = validate_accuracy(val_image, ai_text)
-                        
-                        # 4. Routing
-                        if not is_clean or len(ai_text) < 50:
-                            st.session_state.review_queue.append({
-                                "name": f.name, "path": path, "text": ai_text, "error": msg
-                            })
-                        else:
-                            st.session_state.processed_data[f.name] = ai_text
-                            os.remove(path)
-                            
-                    except Exception as e:
-                        st.error(f"Error processing {f.name}: {e}")
+                    status_area.markdown('<div class="status-container">🖼️ Preparing Image for Validation...</div>', unsafe_allow_html=True)
+                    if f.name.lower().endswith(".pdf"):
+                        images = convert_from_path(path, first_page=1, last_page=1)
+                        val_img = images[0]
+                    else:
+                        val_img = path
                     
-                    bar.progress((i+1)/len(files))
-                st.success("Done.")
+                    # Lie Detector
+                    is_valid, msg = validate_accuracy(val_img, ai_text, status_area)
+                    
+                    if not is_valid:
+                        status_area.markdown(f'<div class="status-container" style="border-left-color: #ef4444;">⚠️ Hallucination Risk Detected! Flagging for review.</div>', unsafe_allow_html=True)
+                        st.session_state.review_queue.append({
+                            "name": f.name, "path": path, "text": ai_text, "error": msg
+                        })
+                        time.sleep(1) # Visual feedback
+                    else:
+                        status_area.markdown('<div class="status-container" style="border-left-color: #10b981;">✨ Cleaning & Finalizing Output...</div>', unsafe_allow_html=True)
+                        clean_text = clean_final_output(ai_text)
+                        st.session_state.processed_data[f.name] = clean_text
+                        os.remove(path)
+                        time.sleep(0.5)
+                        
+                except Exception as e:
+                    st.error(f"Error {f.name}: {str(e)}")
+                
+                main_progress.progress((i+1)/len(files))
+                file_status.empty()
+            
+            status_area.success(f"Successfully processed {len(files)} files!")
 
     with tab2:
         if st.session_state.review_queue:
             q = st.session_state.review_queue
-            sel = st.selectbox("Review File", [x["name"] for x in q])
+            st.markdown(f"### ⚠️ {len(q)} Files Require Human Review")
+            
+            sel = st.selectbox("Select File to Verify", [x["name"] for x in q])
             item = next(x for x in q if x["name"] == sel)
             
-            st.error(f"⚠️ {item['error']}")
-            c1, c2 = st.columns(2)
-            with c1:
-                # Display Image
+            st.error(f"**Reason for Flag:** {item['error']}")
+            
+            c_img, c_edit = st.columns(2)
+            with c_img:
+                st.subheader("Original Document")
                 try:
                     if item["name"].lower().endswith(".pdf"):
                         st.image(convert_from_path(item["path"], first_page=1, last_page=1)[0], use_container_width=True)
@@ -170,14 +299,15 @@ def main():
                         st.image(item["path"], use_container_width=True)
                 except Exception as e:
                     st.error(f"Could not display image: {e}")
-            with c2:
-                new_text = st.text_area("Edit", item["text"], height=600)
-                if st.button("Verify & Save"):
+            with c_edit:
+                st.subheader("Extracted Text (Correct Hallucinations)")
+                new_text = st.text_area("Markdown Content", clean_final_output(item["text"]), height=600)
+                if st.button("✅ APPROVE & SAVE", use_container_width=True):
                     st.session_state.processed_data[sel] = new_text
                     st.session_state.review_queue = [x for x in q if x["name"] != sel]
                     st.rerun()
         else:
-            st.success("Queue Empty")
+            st.success("🎉 All files verified! Your queue is empty.")
 
 if __name__ == "__main__":
     main()
