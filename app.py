@@ -108,18 +108,22 @@ st.markdown("""
 # Initialize Session State
 if "review_queue" not in st.session_state: st.session_state.review_queue = []
 if "processed_data" not in st.session_state: st.session_state.processed_data = {}
+if "active_tab" not in st.session_state: st.session_state.active_tab = "📤 PROCESS"
 
-# 2. THE BRAIN: FULL CATEGORY LIBRARY
+# 2. THE BRAIN: NOISE-CANCELING PROMPTS
 PROMPT_LIBRARY = {
     "⚖️ Legal (Strict)": """
         You are a forensic legal digitizer. 
-        INSTRUCTION: Transcribe text letter-for-letter. 
-        - DO NOT auto-complete names or expand abbreviations.
-        - If text is blurry, write [?].
-        1. STAMPS: **[STAMP: <text> | Date: <date>]**.
-        2. MARGINALIA: **[MARGIN NOTE: <text>]**.
-        3. TABLES: Repair broken tables.
-        4. LANGUAGES: Transcribe Telugu/Hindi/English exactly. DO NOT TRANSLATE.
+        
+        CRITICAL RULES:
+        1. ACCURACY: Transcribe text letter-for-letter. DO NOT auto-complete names.
+        2. NOISE FILTER: IGNORE visual artifacts, punch holes, photocopy streaks, and dust. 
+           - Do NOT output random symbols like '.. . ...,.,,' or ''.
+           - If a section is purely noise, skip it.
+        3. STAMPS: **[STAMP: <text> | Date: <date>]**.
+        4. MARGINALIA: **[MARGIN NOTE: <text>]**.
+        5. TABLES: Repair broken tables.
+        6. LANGUAGES: Transcribe Telugu/Hindi/English exactly.
     """,
     "🧩 Evidence (Jatakam/Grids)": """
         You are digitizing evidentiary grids (Horoscopes/Family Trees).
@@ -127,7 +131,7 @@ PROMPT_LIBRARY = {
         2. SCRIPT: Keep Telugu/Sanskrit script exact. Do not Romanize.
         3. SPATIAL: Maintain box positions perfectly.
     """,
-    "🏠 Property Deeds (Registration)": """
+    "🏠 Property Deeds": """
         You are digitizing Sale Deeds.
         1. THUMBPRINTS: Ignore dark thumbprints overlaying text.
         2. SCHEDULE: Extract boundaries (N/S/E/W) into a table.
@@ -136,7 +140,7 @@ PROMPT_LIBRARY = {
     "🏛️ Revenue Records (Pahani)": """
         You are digitizing Revenue Ledgers.
         1. COLUMNS: Strictly preserve the grid structure (Survey No, Name, Extent).
-        2. HANDWRITING: Capture handwritten remarks in margins.
+        2. HANDWRITING: Capture handwritten remarks.
     """,
     "💰 Banking (Dot Matrix)": """
         You are reading dot-matrix text.
@@ -145,20 +149,32 @@ PROMPT_LIBRARY = {
     """
 }
 
-# 3. THE "GARBAGE REMOVER" FUNCTION
+# 3. THE "GARBAGE TRUCK" CLEANER
 def clean_final_output(text):
     """
-    Removes the raw OCR dump and any 'Hallucination Check' markers.
+    Removes raw OCR noise and common garbage patterns from the start of the file.
     """
-    # 1. Remove the specific Raw OCR Block (inclusive of the marker)
-    # This regex looks for the marker and everything after it until a separator or end of block
-    pattern = r"\*\*\[STAMP: CURRENT_PAGE_RAW_OCR_TEXT\]\*\*.*?(?=\n\n|\Z)"
-    cleaned = re.sub(pattern, "", text, flags=re.DOTALL)
+    # 1. Remove the "Raw OCR" block if it exists (Regex handles bold/non-bold)
+    pattern = r"(\*\*)?\[STAMP: CURRENT_PAGE_RAW_OCR_TEXT\](\*\*)?.*?(?=\n\n|\Z)"
+    text = re.sub(pattern, "", text, flags=re.DOTALL)
     
-    # 2. Remove common AI prefixes if they exist
+    # 2. Regex to remove blocks of high-density symbol garbage (ASCII noise)
+    lines = text.split('\n')
+    clean_lines = []
+    for line in lines:
+        # Calculate ratio of symbols to length
+        if len(line) > 5:
+            symbols = len(re.findall(r'[^a-zA-Z0-9\s]', line))
+            if symbols / len(line) > 0.4:
+                continue # Skip garbage line
+        clean_lines.append(line)
+        
+    cleaned = "\n".join(clean_lines).strip()
+    
+    # 3. Remove common AI prefixes if they exist
     cleaned = re.sub(r'^(Here is the transcription:|Based on the document provided:)', '', cleaned, flags=re.IGNORECASE).strip()
     
-    return cleaned.strip()
+    return cleaned
 
 # 4. THE "LIE DETECTOR" FUNCTION (Anti-Hallucination)
 def validate_accuracy(image_path, ai_text, status_placeholder):
@@ -212,7 +228,10 @@ def main():
     st.markdown("<h1 style='text-align: center;'>🇮🇳 Indian Document Digitizer <span style='color: #3b82f6; font-size: 0.5em;'>PRO</span></h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align: center; color: #94a3b8;'>Zero-Hallucination AI Extraction for Complex Indian Records</p>", unsafe_allow_html=True)
 
-    tab1, tab2 = st.tabs(["📤 PROCESS", "🕵️ REVIEW"])
+    # Tab handling for logical flow
+    tabs = ["📤 PROCESS", "🕵️ REVIEW"]
+    active_tab_index = tabs.index(st.session_state.active_tab)
+    tab1, tab2 = st.tabs(tabs)
 
     with tab1:
         col_up, col_info = st.columns([2, 1])
@@ -284,6 +303,18 @@ def main():
                 file_status.empty()
             
             status_area.success(f"Successfully processed {len(files)} files!")
+            
+            # Logical Flow: Next Steps
+            st.divider()
+            col_next1, col_next2 = st.columns(2)
+            with col_next1:
+                if st.session_state.review_queue:
+                    if st.button("🕵️ GO TO REVIEW QUEUE", use_container_width=True):
+                        st.session_state.active_tab = "🕵️ REVIEW"
+                        st.rerun()
+            with col_next2:
+                if st.session_state.processed_data:
+                    st.info("Batch complete! Use the sidebar to download your verified ZIP.")
 
     with tab2:
         if st.session_state.review_queue:
@@ -311,9 +342,14 @@ def main():
                 if st.button("✅ APPROVE & SAVE", use_container_width=True):
                     st.session_state.processed_data[sel] = new_text
                     st.session_state.review_queue = [x for x in q if x["name"] != sel]
+                    if not st.session_state.review_queue:
+                        st.session_state.active_tab = "📤 PROCESS"
                     st.rerun()
         else:
             st.success("🎉 All files verified! Your queue is empty.")
+            if st.button("⬅️ BACK TO UPLOAD", use_container_width=True):
+                st.session_state.active_tab = "📤 PROCESS"
+                st.rerun()
 
 if __name__ == "__main__":
     main()
