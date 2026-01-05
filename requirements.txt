@@ -1,0 +1,6 @@
+streamlit
+llama-parse
+nest_asyncio
+python-dotenv
+pdf2image
+pillow
