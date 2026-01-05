@@ -147,12 +147,18 @@ PROMPT_LIBRARY = {
 
 # 3. THE "GARBAGE REMOVER" FUNCTION
 def clean_final_output(text):
-    """Removes raw OCR artifacts and common AI filler."""
-    if "[STAMP: CURRENT_PAGE_RAW_OCR_TEXT]" in text:
-        text = text.split("[STAMP: CURRENT_PAGE_RAW_OCR_TEXT]")[0]
-    # Remove common AI prefixes if they exist
-    text = re.sub(r'^(Here is the transcription:|Based on the document provided:)', '', text, flags=re.IGNORECASE).strip()
-    return text
+    """
+    Removes the raw OCR dump and any 'Hallucination Check' markers.
+    """
+    # 1. Remove the specific Raw OCR Block (inclusive of the marker)
+    # This regex looks for the marker and everything after it until a separator or end of block
+    pattern = r"\*\*\[STAMP: CURRENT_PAGE_RAW_OCR_TEXT\]\*\*.*?(?=\n\n|\Z)"
+    cleaned = re.sub(pattern, "", text, flags=re.DOTALL)
+    
+    # 2. Remove common AI prefixes if they exist
+    cleaned = re.sub(r'^(Here is the transcription:|Based on the document provided:)', '', cleaned, flags=re.IGNORECASE).strip()
+    
+    return cleaned.strip()
 
 # 4. THE "LIE DETECTOR" FUNCTION (Anti-Hallucination)
 def validate_accuracy(image_path, ai_text, status_placeholder):
