@@ -198,7 +198,7 @@ def clean_final_output(text):
     
     return cleaned
 
-# 4. HYBRID VALIDATION ENGINE (3-ZONE LOGIC)
+# 4. HYBRID VALIDATION ENGINE (CRASH-PROOF)
 def process_hybrid_validation(file_path, ai_text, status_placeholder):
     """
     Returns: (final_text, manual_review_items, logs)
@@ -213,62 +213,65 @@ def process_hybrid_validation(file_path, ai_text, status_placeholder):
             pages = convert_from_path(file_path)
         else:
             pages = [Image.open(file_path)]
-    except:
-        return ai_text, [], ["OCR Engine Failed to load image."]
+            
+        # Build Ground Truth
+        full_document_ocr = [] 
+        for page_idx, page_img in enumerate(pages):
+            data = pytesseract.image_to_data(page_img, output_type=Output.DICT)
+            n_boxes = len(data['text'])
+            for i in range(n_boxes):
+                word = data['text'][i].strip()
+                if word:
+                    full_document_ocr.append({
+                        "text": word, "page": page_idx,
+                        "box": (data['left'][i], data['top'][i], data['width'][i], data['height'][i])
+                    })
 
-    # Build Ground Truth
-    full_document_ocr = [] 
-    for page_idx, page_img in enumerate(pages):
-        data = pytesseract.image_to_data(page_img, output_type=Output.DICT)
-        n_boxes = len(data['text'])
-        for i in range(n_boxes):
-            word = data['text'][i].strip()
-            if word:
-                full_document_ocr.append({
-                    "text": word, "page": page_idx,
-                    "box": (data['left'][i], data['top'][i], data['width'][i], data['height'][i])
-                })
-
-    raw_words_list = [item["text"] for item in full_document_ocr]
-    raw_text_blob = " ".join(raw_words_list)
-    stopwords = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT", "APPLICANT", "DEFENDANT", "COUNSEL", "ADVOCATE", "HYDERABAD", "TRIBUNAL", "ORDER", "OFFICE", "PAGE"]
-    
-    ai_words = set(re.findall(r'\b[A-Z][a-z]{2,}\b', ai_text))
-    ai_words.update(set(re.findall(r'\b[A-Z]{3,}\b', ai_text)))
-    
-    for suspect_word in ai_words:
-        clean_word = suspect_word.strip(".,;:").upper()
-        if clean_word in stopwords: continue
+        raw_words_list = [item["text"] for item in full_document_ocr]
+        raw_text_blob = " ".join(raw_words_list)
+        stopwords = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT", "APPLICANT", "DEFENDANT", "COUNSEL", "ADVOCATE", "HYDERABAD", "TRIBUNAL", "ORDER", "OFFICE", "PAGE"]
         
-        # Check if word is missing or distorted
-        if fuzz.partial_ratio(suspect_word.lower(), raw_text_blob.lower()) < 85:
-            # Find Best Match in Scan
-            match_word, score = process.extractOne(suspect_word, raw_words_list)
+        ai_words = set(re.findall(r'\b[A-Z][a-z]{2,}\b', ai_text))
+        ai_words.update(set(re.findall(r'\b[A-Z]{3,}\b', ai_text)))
+        
+        for suspect_word in ai_words:
+            clean_word = suspect_word.strip(".,;:").upper()
+            if clean_word in stopwords: continue
             
-            # Find coordinates for the match
-            best_match = next((item for item in full_document_ocr if item["text"] == match_word), None)
-            
-            # --- THE HYBRID 3-ZONE LOGIC ---
-            if score > 85:
-                # ZONE 1: GREEN (Auto-Fix)
-                final_text = final_text.replace(suspect_word, match_word)
-                logs.append(f"✅ Auto-Fixed: '{suspect_word}' -> '{match_word}' ({score}%)")
-            
-            elif score < 40:
-                # ZONE 2: RED (Auto-Delete Ghost)
-                final_text = final_text.replace(suspect_word, "")
-                logs.append(f"👻 Auto-Deleted Ghost: '{suspect_word}'")
-            
-            else:
-                # ZONE 3: GREY (Human Review)
-                manual_review_items.append({
-                    "word": suspect_word,
-                    "page": best_match["page"] if best_match else 0,
-                    "suggested_fix": match_word if best_match else "[Unknown]",
-                    "match_score": score,
-                    "ocr_data": best_match
-                })
-                logs.append(f"⚠️ Flagged for Review: '{suspect_word}' vs '{match_word}' ({score}%)")
+            # Check if word is missing or distorted
+            if fuzz.partial_ratio(suspect_word.lower(), raw_text_blob.lower()) < 85:
+                # Find Best Match in Scan
+                match_word, score = process.extractOne(suspect_word, raw_words_list) if raw_words_list else (None, 0)
+                
+                # Find coordinates for the match
+                best_match = next((item for item in full_document_ocr if item["text"] == match_word), None) if match_word else None
+                
+                # --- THE HYBRID 3-ZONE LOGIC ---
+                if score > 85:
+                    # ZONE 1: GREEN (Auto-Fix)
+                    final_text = final_text.replace(suspect_word, match_word)
+                    logs.append(f"✅ Auto-Fixed: '{suspect_word}' -> '{match_word}' ({score}%)")
+                
+                elif score < 40:
+                    # ZONE 2: RED (Auto-Delete Ghost)
+                    final_text = final_text.replace(suspect_word, "")
+                    logs.append(f"👻 Auto-Deleted Ghost: '{suspect_word}'")
+                
+                else:
+                    # ZONE 3: GREY (Human Review)
+                    manual_review_items.append({
+                        "word": suspect_word,
+                        "page": best_match["page"] if best_match else 0,
+                        "suggested_fix": match_word if best_match else "[Unknown]",
+                        "match_score": score,
+                        "ocr_data": best_match
+                    })
+                    logs.append(f"⚠️ Flagged for Review: '{suspect_word}' vs '{match_word}' ({score}%)")
+
+    except Exception as e:
+        # CRITICAL FIX: If OCR fails, FORCE REVIEW instead of passing silently
+        error_msg = f"System Error (OCR Failed): {str(e)}"
+        return ai_text, [{"word": "SYSTEM_FAILURE", "suggested_fix": "Retry or Manual Check", "page": 0, "ocr_data": None}], [error_msg]
 
     return final_text, manual_review_items, logs
 
@@ -354,8 +357,10 @@ def main():
             main_progress = st.progress(0)
             status_area = st.empty()
             
-            # Reset logs for new batch
+            # Reset for new batch
             st.session_state.audit_logs = []
+            st.session_state.review_queue = []
+            st.session_state.processed_data = {}
             
             for i, f in enumerate(files):
                 file_status = st.empty()
@@ -376,20 +381,16 @@ def main():
                     st.session_state.audit_logs.extend([f"<b>--- {f.name} ---</b>"] + file_logs)
                     
                     if errors:
-                        status_area.markdown(f'<div class="status-container" style="border-left-color: #f59e0b;">⚠️ {len(errors)} items in Grey Zone. Flagging for review.</div>', unsafe_allow_html=True)
                         st.session_state.review_queue.append({
                             "name": f.name, 
                             "path": path, 
                             "text": clean_text, 
                             "errors": errors
                         })
-                        time.sleep(1)
                     else:
-                        status_area.markdown('<div class="status-container" style="border-left-color: #10b981;">✨ All items Auto-Fixed/Clean. Finalizing...</div>', unsafe_allow_html=True)
                         final_clean = clean_final_output(clean_text)
                         st.session_state.processed_data[f.name] = final_clean
                         os.remove(path)
-                        time.sleep(0.5)
                         
                 except Exception as e:
                     st.error(f"Error {f.name}: {str(e)}")
@@ -397,19 +398,17 @@ def main():
                 main_progress.progress((i+1)/len(files))
                 file_status.empty()
             
-            status_area.success(f"Successfully processed {len(files)} files!")
-            
-            # Logical Flow: Next Steps
-            st.divider()
-            col_next1, col_next2 = st.columns(2)
-            with col_next1:
-                if st.session_state.review_queue:
-                    if st.button("🔍 GO TO REVIEW DASHBOARD", width="stretch"):
-                        st.session_state.active_tab = "🔍 REVIEW DASHBOARD"
-                        st.rerun()
-            with col_next2:
-                if st.session_state.processed_data:
-                    st.info("Batch complete! Use the sidebar to download your verified ZIP.")
+            # CRITICAL FIX: Refresh page to show download buttons and review tabs
+            st.rerun()
+
+        # MAIN PAGE DOWNLOAD (For Visibility)
+        if st.session_state.processed_data and not st.session_state.review_queue:
+            st.success("✅ All files processed successfully!")
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zf:
+                for n, c in st.session_state.processed_data.items():
+                    zf.writestr(os.path.splitext(n)[0]+".md", c)
+            st.download_button("📥 DOWNLOAD ALL (ZIP)", zip_buffer.getvalue(), "completed_docs.zip", "application/zip", type="primary", width="stretch")
 
     with tab2:
         if st.session_state.review_queue:
@@ -445,74 +444,87 @@ def main():
                 
                 # --- LEFT: THE VISUAL PROOF ---
                 with col_left:
-                    st.markdown(f"**📍 Page {curr_err['page']+1}** (Match Confidence: `{curr_err['match_score']}%`)")
-                    box = curr_err["ocr_data"]["box"] if curr_err["ocr_data"] else None
-                    img = get_zoomed_image(item["path"], curr_err["page"], box)
-                    if img:
-                        st.image(img, width="stretch")
+                    if curr_err["word"] == "SYSTEM_FAILURE":
+                        st.error("System Error preventing validation.")
+                        st.image(item["path"], width="stretch", caption="Original File")
                     else:
-                        st.warning("Preview unavailable")
+                        st.markdown(f"**📍 Page {curr_err['page']+1}** (Match Confidence: `{curr_err.get('match_score', 0)}%`)")
+                        box = curr_err["ocr_data"]["box"] if curr_err["ocr_data"] else None
+                        img = get_zoomed_image(item["path"], curr_err["page"], box)
+                        if img:
+                            st.image(img, width="stretch")
+                        else:
+                            st.warning("Preview unavailable")
 
                 # --- RIGHT: THE FIX WIZARD ---
                 with col_right:
-                    st.markdown("### 🛠️ Grey Zone Conflict")
-                    st.info("The Auto-Pilot is unsure. Please verify this match.")
-                    st.error(f"AI Read: **{curr_err['word']}**")
+                    st.markdown("### 🛠️ Review Required")
                     
-                    # Context Snippet
-                    start = item["text"].find(curr_err["word"])
-                    if start != -1:
-                        snippet = item["text"][max(0, start-30):min(len(item["text"]), start+30)]
-                        st.caption(f"...{snippet}...")
-                    
-                    st.markdown("#### Select Correction:")
-                    
-                    # Options
-                    options = [
-                        f"Accept Scan: '{curr_err['suggested_fix']}'",
-                        f"Keep AI: '{curr_err['word']}'",
-                        "Mark as [ILLEGIBLE]",
-                        "Delete (Noise)"
-                    ]
-                    
-                    choice = st.radio("Action:", options, key=f"rad_{sel_file}_{st.session_state.err_idx}", index=None)
-                    manual = st.text_input("Or type correction:", key=f"man_{sel_file}_{st.session_state.err_idx}")
-                    
-                    # Navigation Handlers
-                    c_prev, c_next = st.columns(2)
-                    
-                    with c_prev:
-                        if st.button("⬅️ Previous"):
-                            if st.session_state.err_idx > 0:
-                                st.session_state.err_idx -= 1
-                                st.rerun()
-                    
-                    with c_next:
-                        if st.button("Confirm & Next ➡️", type="primary"):
-                            final_val = None
-                            if manual: 
-                                final_val = manual
-                            elif choice:
-                                if "Accept Scan" in choice:
-                                    final_val = curr_err['suggested_fix']
-                                elif "Keep AI" in choice:
-                                    final_val = curr_err["word"]
-                                elif "Delete" in choice:
-                                    final_val = ""
-                                elif "ILLEGIBLE" in choice:
-                                    final_val = "[ILLEGIBLE]"
-                            
-                            if final_val is not None:
-                                item["text"] = item["text"].replace(curr_err["word"], final_val)
-                                if st.session_state.err_idx < len(errors) - 1:
-                                    st.session_state.err_idx += 1
+                    if curr_err["word"] == "SYSTEM_FAILURE":
+                        st.warning("The Validation System crashed on this file (likely Tesseract missing).")
+                        st.info("Manual check required.")
+                        if st.button("Accept AI Output Anyway", width="stretch"):
+                            st.session_state.processed_data[sel_file] = clean_final_output(item["text"])
+                            st.session_state.review_queue = [x for x in q if x["name"] != sel_file]
+                            st.rerun()
+                    else:
+                        st.info("The Auto-Pilot is unsure. Please verify this match.")
+                        st.error(f"AI Read: **{curr_err['word']}**")
+                        
+                        # Context Snippet
+                        start = item["text"].find(curr_err["word"])
+                        if start != -1:
+                            snippet = item["text"][max(0, start-30):min(len(item["text"]), start+30)]
+                            st.caption(f"...{snippet}...")
+                        
+                        st.markdown("#### Select Correction:")
+                        
+                        # Options
+                        options = [
+                            f"Accept Scan: '{curr_err['suggested_fix']}'",
+                            f"Keep AI: '{curr_err['word']}'",
+                            "Mark as [ILLEGIBLE]",
+                            "Delete (Noise)"
+                        ]
+                        
+                        choice = st.radio("Action:", options, key=f"rad_{sel_file}_{st.session_state.err_idx}", index=None)
+                        manual = st.text_input("Or type correction:", key=f"man_{sel_file}_{st.session_state.err_idx}")
+                        
+                        # Navigation Handlers
+                        c_prev, c_next = st.columns(2)
+                        
+                        with c_prev:
+                            if st.button("⬅️ Previous"):
+                                if st.session_state.err_idx > 0:
+                                    st.session_state.err_idx -= 1
                                     st.rerun()
+                        
+                        with c_next:
+                            if st.button("Confirm & Next ➡️", type="primary"):
+                                final_val = None
+                                if manual: 
+                                    final_val = manual
+                                elif choice:
+                                    if "Accept Scan" in choice:
+                                        final_val = curr_err['suggested_fix']
+                                    elif "Keep AI" in choice:
+                                        final_val = curr_err["word"]
+                                    elif "Delete" in choice:
+                                        final_val = ""
+                                    elif "ILLEGIBLE" in choice:
+                                        final_val = "[ILLEGIBLE]"
+                                
+                                if final_val is not None:
+                                    item["text"] = item["text"].replace(curr_err["word"], final_val)
+                                    if st.session_state.err_idx < len(errors) - 1:
+                                        st.session_state.err_idx += 1
+                                        st.rerun()
+                                    else:
+                                        st.success("File Verified!")
+                                        st.session_state.show_save = True
+                                        st.rerun()
                                 else:
-                                    st.success("File Verified!")
-                                    st.session_state.show_save = True
-                                    st.rerun()
-                            else:
-                                st.warning("Please select a correction or type one.")
+                                    st.warning("Please select a correction or type one.")
 
                     # SAVE BUTTON
                     if st.session_state.get("show_save"):
@@ -545,10 +557,13 @@ def main():
             st.markdown("### 📝 Final Verification")
             st.text_area("Full Text Preview", value=clean_final_output(item["text"]), height=300)
         else:
-            st.success("🎉 All documents verified and ready for download!")
-            if st.button("⬅️ BACK TO UPLOAD", width="stretch"):
-                st.session_state.active_tab = "📤 PROCESS"
-                st.rerun()
+            if st.session_state.processed_data:
+                st.success("🎉 All documents verified and ready for download!")
+                if st.button("⬅️ BACK TO UPLOAD", width="stretch"):
+                    st.session_state.active_tab = "📤 PROCESS"
+                    st.rerun()
+            else:
+                st.info("No documents in the review queue.")
 
 if __name__ == "__main__":
     main()
