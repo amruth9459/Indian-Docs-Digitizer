@@ -434,7 +434,7 @@ def main():
                     
                     # Options
                     options = []
-                    if curr_err["suggest_fix"] != "[Unknown]":
+                    if curr_err["suggested_fix"] != "[Unknown]":
                         options.append(f"Replace with: '{curr_err['suggested_fix']}' (Raw Scan)")
                     
                     # Common Legal Corrections
