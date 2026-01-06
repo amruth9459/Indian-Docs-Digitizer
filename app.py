@@ -505,15 +505,15 @@ def main():
                         st.session_state.active_tab = "📤 PROCESS"
                     st.rerun()
 
-            st.markdown("### 📝 Final Verification")
-            st.text_area("Full Text Preview", value=clean_final_output(item["text"]), height=300)
-
             else:
                 st.info("No errors detected in this file.")
                 if st.button("Mark as Done", use_container_width=True):
                     st.session_state.processed_data[sel_file] = clean_final_output(item["text"])
                     st.session_state.review_queue = [x for x in q if x["name"] != sel_file]
                     st.rerun()
+
+            st.markdown("### 📝 Final Verification")
+            st.text_area("Full Text Preview", value=clean_final_output(item["text"]), height=300)
         else:
             st.success("🎉 All documents verified and ready for download!")
             if st.button("⬅️ BACK TO UPLOAD", use_container_width=True):
