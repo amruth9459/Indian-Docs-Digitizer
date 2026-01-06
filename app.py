@@ -18,12 +18,19 @@ import time
 nest_asyncio.apply()
 st.set_page_config(page_title="Forensic Multilingual Digitizer", page_icon="⚖️", layout="wide")
 
+# Custom CSS for Live View
+st.markdown("""
+    <style>
+        .judge-card { border-left: 5px solid #FF4B4B; background: #262730; padding: 10px; margin-bottom: 10px; }
+        .stButton>button { font-weight: bold; border-radius: 5px; }
+    </style>
+""", unsafe_allow_html=True)
+
 if "processed_data" not in st.session_state: st.session_state.processed_data = {}
 if "review_queue" not in st.session_state: st.session_state.review_queue = []
 
 # 2. LANGUAGE DETECTION HELPER
 def contains_foreign_script(text):
-    # Detects non-ASCII characters (common in Telugu/Hindi/etc)
     return any(ord(char) > 127 for char in text)
 
 # 3. THE MULTI-ROUND JUDGE
@@ -32,7 +39,6 @@ def consult_gemini_forensic(image_crop, ai_guess, scan_guess, api_key):
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
         
-        # Determine if we need the multilingual prompt
         is_multilingual = contains_foreign_script(scan_guess)
         
         prompt = f"""
@@ -53,23 +59,49 @@ def consult_gemini_forensic(image_crop, ai_guess, scan_guess, api_key):
     except:
         return "[ERROR_CALLING_JUDGE]"
 
-# 4. REPLACEMENT LOGIC (Prevents stuttering)
+# 4. REPLACEMENT LOGIC
 def safe_replace_entity(text, old_val, new_val):
     if not new_val or new_val == old_val: return text
-    # Prevents replacing "Pega" with "Pegasus" if "Pegasus" is already there
     if new_val in text and old_val in new_val: return text
     return re.sub(r'\b' + re.escape(old_val) + r'\b', new_val, text)
 
-# 5. MAIN PIPELINE
+# 5. SMART DOWNLOAD RENDERER
+def render_download_button(location="sidebar"):
+    if not st.session_state.processed_data: return
+    count = len(st.session_state.processed_data)
+    
+    if count == 1:
+        filename, content = list(st.session_state.processed_data.items())[0]
+        clean_name = os.path.splitext(filename)[0] + ".md"
+        btn_label = f"📥 Download {clean_name}"
+        mime_type = "text/markdown"
+        data = content
+    else:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            for n, c in st.session_state.processed_data.items(): zf.writestr(os.path.splitext(n)[0]+".md", c)
+        btn_label = f"📥 Download All ({count} Files)"
+        mime_type = "application/zip"
+        data = zip_buffer.getvalue()
+        clean_name = "verified_docs.zip"
+
+    if location == "sidebar":
+        st.sidebar.download_button(btn_label, data, clean_name, mime_type)
+    else:
+        st.download_button(btn_label, data, clean_name, mime_type, type="primary", use_container_width=True)
+
+# 6. MAIN PIPELINE
 def run_pipeline(file_path, lk, gk, live_view):
     logs = []
     
-    live_view.info("🔄 Round 1: LlamaParse Intelligence...")
+    with live_view.container():
+        st.info("🧠 Round 1: LlamaParse Intelligence...")
     parser = LlamaParse(api_key=lk, result_type="markdown")
     docs = parser.load_data(file_path)
     final_text = "\n\n".join([d.text for d in docs])
 
-    live_view.info("🔄 Round 2: Tesseract Spatial Mapping...")
+    with live_view.container():
+        st.info("📸 Round 2: Tesseract Spatial Mapping...")
     pages = convert_from_path(file_path, dpi=300) if file_path.lower().endswith(".pdf") else [Image.open(file_path)]
     
     full_ocr_data = []
@@ -84,16 +116,16 @@ def run_pipeline(file_path, lk, gk, live_view):
                 })
     raw_blob = " ".join([x["text"] for x in full_ocr_data])
 
-    live_view.info("🔄 Round 3: Visual Audit...")
-    ai_entities = set(re.findall(r'\b[A-Z][a-z]{2,}\b', final_text))
+    with live_view.container():
+        st.info("⚖️ Round 3: Visual Audit (Live)...")
     
+    ai_entities = set(re.findall(r'\b[A-Z][a-z]{2,}\b', final_text))
     manual_needed = []
 
     for word in ai_entities:
         if word.upper() in ["BEFORE", "COURT", "INDIA", "STAMP", "DATE"]: continue
         
         if fuzz.partial_ratio(word.lower(), raw_blob.lower()) < 80:
-            # Find closest box to see what happened
             best_match = None
             best_score = 0
             for item in full_ocr_data:
@@ -106,33 +138,34 @@ def run_pipeline(file_path, lk, gk, live_view):
                 x, y, w, h = best_match["box"]
                 crop = best_match["img"].crop((max(0, x-10), max(0, y-10), x+w+10, y+h+10))
                 
-                verdict = consult_gemini_forensic(crop, word, best_match["text"], gk)
-                
-                # FLAG FOR HUMAN REVIEW IF:
-                # 1. Gemini says it's illegible
-                # 2. It's a foreign script Gemini isn't 100% sure about
-                # 3. AI and Judge completely disagree
+                # --- LIVE VIEW UPDATE ---
+                with live_view.container():
+                    c1, c2 = st.columns([1, 3])
+                    with c1: st.image(crop, width=100)
+                    with c2: 
+                        st.caption(f"Checking: **{word}**")
+                        with st.spinner("Judging..."):
+                            verdict = consult_gemini_forensic(crop, word, best_match["text"], gk)
+                # ------------------------
+
                 if "[ILLEGIBLE]" in verdict or contains_foreign_script(verdict):
                     manual_needed.append({"word": word, "verdict": verdict, "crop": crop, "page": best_match["page"]})
                 else:
                     final_text = safe_replace_entity(final_text, word, verdict)
                     logs.append(f"Fixed: {word} -> {verdict}")
+                
+                # Small delay to make the live view readable
+                time.sleep(0.1)
 
     return final_text, manual_needed, logs
 
-# 6. UI
+# 7. UI
 st.title("⚖️ Forensic Human-in-the-Loop Digitizer")
 with st.sidebar:
     lk = st.text_input("LlamaCloud Key", type="password")
     gk = st.text_input("Gemini Key", type="password")
-    if st.session_state.processed_data:
-        st.divider()
-        st.success("Processing Complete")
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for n, c in st.session_state.processed_data.items():
-                zf.writestr(os.path.splitext(n)[0]+".md", c)
-        st.download_button("📥 Download All Results", zip_buffer.getvalue(), "final_docs.zip", "application/zip")
+    st.divider()
+    render_download_button("sidebar")
 
 tab1, tab2 = st.tabs(["📤 Upload & Process", "🔍 Manual Review Queue"])
 
@@ -144,7 +177,13 @@ with tab1:
             st.stop()
             
         live_window = st.empty()
-        for f in files:
+        # Clear previous data
+        st.session_state.processed_data = {}
+        st.session_state.review_queue = []
+        
+        progress_bar = st.progress(0)
+        
+        for i, f in enumerate(files):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(f.getbuffer())
                 path = tmp.name
@@ -153,15 +192,24 @@ with tab1:
             
             if manual:
                 st.session_state.review_queue.append({"name": f.name, "text": res, "items": manual})
-                st.warning(f"⚠️ {f.name} requires manual review. Check the 'Manual Review Queue' tab.")
+                st.warning(f"⚠️ {f.name} requires manual review.")
             else:
                 st.session_state.processed_data[f.name] = res
                 st.success(f"✅ {f.name} processed successfully!")
+            
+            progress_bar.progress((i+1)/len(files))
+        
+        live_window.empty()
         
         if not st.session_state.review_queue:
             st.success("Batch Complete! All files processed automatically.")
+            # IMMEDIATE DOWNLOAD BUTTON
+            st.divider()
+            c1, c2, c3 = st.columns([1, 2, 1])
+            with c2:
+                render_download_button("main")
         else:
-            st.info("Batch Complete. Some files require manual review.")
+            st.info("Batch Complete. Some files require manual review. Please switch to the 'Manual Review Queue' tab.")
 
 with tab2:
     if st.session_state.review_queue:
@@ -174,7 +222,7 @@ with tab2:
                 with col2:
                     st.write(f"**AI Suspect:** `{item['word']}`")
                     st.write(f"**Judge Verdict:** `{item['verdict']}`")
-                    user_fix = st.text_input(f"Correct this word (or leave as is):", value=item['verdict'], key=f"fix_{idx}_{i}")
+                    user_fix = st.text_input(f"Correct this word:", value=item['verdict'], key=f"fix_{idx}_{i}")
                     if st.button(f"Apply Correction", key=f"btn_{idx}_{i}"):
                         file_review['text'] = safe_replace_entity(file_review['text'], item['word'], user_fix)
                         st.success("Updated!")
