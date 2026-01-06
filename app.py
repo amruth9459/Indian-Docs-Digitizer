@@ -13,6 +13,7 @@ from thefuzz import fuzz, process
 from llama_parse import LlamaParse
 from pdf2image import convert_from_path
 from PIL import Image, ImageDraw
+import google.generativeai as genai
 
 # 1. SYSTEM SETUP
 nest_asyncio.apply()
@@ -25,7 +26,7 @@ except ImportError:
     POPPLER_INSTALLED = False
 
 st.set_page_config(
-    page_title="Legal Digitizer Pro: Hybrid", 
+    page_title="Legal Digitizer Pro: Visual Judge", 
     page_icon="⚖️", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -198,19 +199,48 @@ def clean_final_output(text):
     
     return cleaned
 
-# 4. HYBRID VALIDATION ENGINE (CRASH-PROOF)
-def process_hybrid_validation(file_path, ai_text, status_placeholder):
+# 4. THE VISION JUDGE (Gemini 1.5 Flash)
+def consult_gemini_vision(image_crop, option_a, option_b, api_key):
+    """
+    Sends the specific image crop to Gemini to decide what the text actually is.
+    """
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = f"""
+        You are a forensic document expert. Look at this image crop of a single word/phrase.
+        
+        Conflict:
+        1. Option A (AI Guess): "{option_a}"
+        2. Option B (OCR Scan): "{option_b}"
+        
+        Task:
+        - Read the text in the image exactly.
+        - If it matches one of the options, output that option.
+        - If both are wrong, output exactly what you see.
+        - Do not output explanations. Just the final text.
+        """
+        
+        response = model.generate_content([prompt, image_crop])
+        return response.text.strip()
+    except Exception as e:
+        return option_a # Fallback to AI's initial guess if Vision fails
+
+# 5. HYBRID VALIDATION ENGINE (WITH VISION JUDGE)
+def process_hybrid_validation(file_path, ai_text, status_placeholder, google_key=None):
     """
     Returns: (final_text, manual_review_items, logs)
     """
-    status_placeholder.markdown('<div class="status-container">🔍 Running Hybrid Cross-Examination...</div>', unsafe_allow_html=True)
+    status_placeholder.markdown('<div class="status-container">🔍 Running Visual Hybrid Cross-Examination...</div>', unsafe_allow_html=True)
     manual_review_items = []
     logs = []
     final_text = ai_text
     
     try:
         if file_path.lower().endswith(".pdf"):
-            pages = convert_from_path(file_path)
+            # Higher DPI for the Vision Judge
+            pages = convert_from_path(file_path, dpi=300)
         else:
             pages = [Image.open(file_path)]
             
@@ -224,7 +254,8 @@ def process_hybrid_validation(file_path, ai_text, status_placeholder):
                 if word:
                     full_document_ocr.append({
                         "text": word, "page": page_idx,
-                        "box": (data['left'][i], data['top'][i], data['width'][i], data['height'][i])
+                        "box": (data['left'][i], data['top'][i], data['width'][i], data['height'][i]),
+                        "img_obj": page_img
                     })
 
         raw_words_list = [item["text"] for item in full_document_ocr]
@@ -246,7 +277,7 @@ def process_hybrid_validation(file_path, ai_text, status_placeholder):
                 # Find coordinates for the match
                 best_match = next((item for item in full_document_ocr if item["text"] == match_word), None) if match_word else None
                 
-                # --- THE HYBRID 3-ZONE LOGIC ---
+                # --- THE HYBRID 3-ZONE LOGIC WITH VISION JUDGE ---
                 if score > 85:
                     # ZONE 1: GREEN (Auto-Fix)
                     final_text = final_text.replace(suspect_word, match_word)
@@ -258,28 +289,44 @@ def process_hybrid_validation(file_path, ai_text, status_placeholder):
                     logs.append(f"👻 Auto-Deleted Ghost: '{suspect_word}'")
                 
                 else:
-                    # ZONE 3: GREY (Human Review)
-                    manual_review_items.append({
-                        "word": suspect_word,
-                        "page": best_match["page"] if best_match else 0,
-                        "suggested_fix": match_word if best_match else "[Unknown]",
-                        "match_score": score,
-                        "ocr_data": best_match
-                    })
-                    logs.append(f"⚠️ Flagged for Review: '{suspect_word}' vs '{match_word}' ({score}%)")
+                    # ZONE 3: GREY (Vision Judge or Human Review)
+                    if google_key and best_match:
+                        # CALL THE VISUAL JUDGE
+                        x, y, w, h = best_match["box"]
+                        padding = 15
+                        page_w, page_h = best_match["img_obj"].size
+                        crop_box = (max(0, x-padding), max(0, y-padding), min(page_w, x+w+padding), min(page_h, y+h+padding))
+                        image_crop = best_match["img_obj"].crop(crop_box)
+                        
+                        verdict = consult_gemini_vision(image_crop, suspect_word, match_word, google_key)
+                        
+                        if verdict != suspect_word:
+                            final_text = final_text.replace(suspect_word, verdict)
+                            logs.append(f"👁️ VISION VERDICT: '{verdict}' (Replaced '{suspect_word}')")
+                        else:
+                            logs.append(f"✅ VISION CONFIRMED: '{suspect_word}' is correct.")
+                    else:
+                        # No Vision Key or No Match -> Human Review
+                        manual_review_items.append({
+                            "word": suspect_word,
+                            "page": best_match["page"] if best_match else 0,
+                            "suggested_fix": match_word if best_match else "[Unknown]",
+                            "match_score": score,
+                            "ocr_data": best_match
+                        })
+                        logs.append(f"⚠️ Flagged for Review: '{suspect_word}' vs '{match_word}' ({score}%)")
 
     except Exception as e:
-        # CRITICAL FIX: If OCR fails, FORCE REVIEW instead of passing silently
-        error_msg = f"System Error (OCR Failed): {str(e)}"
+        error_msg = f"System Error (Validation Failed): {str(e)}"
         return ai_text, [{"word": "SYSTEM_FAILURE", "suggested_fix": "Retry or Manual Check", "page": 0, "ocr_data": None}], [error_msg]
 
     return final_text, manual_review_items, logs
 
-# 5. CROP & ZOOM HIGHLIGHTER
+# 6. CROP & ZOOM HIGHLIGHTER
 def get_zoomed_image(file_path, page_idx, target_box=None):
     try:
         if file_path.lower().endswith(".pdf"):
-            page = convert_from_path(file_path, first_page=page_idx+1, last_page=page_idx+1)[0]
+            page = convert_from_path(file_path, first_page=page_idx+1, last_page=page_idx+1, dpi=300)[0]
         else:
             page = Image.open(file_path).convert("RGB")
             
@@ -293,11 +340,12 @@ def get_zoomed_image(file_path, page_idx, target_box=None):
     except:
         return None
 
-# 6. MAIN APP INTERFACE
+# 7. MAIN APP INTERFACE
 def main():
     with st.sidebar:
         st.markdown("<h1 style='text-align: center; color: #3b82f6;'>⚙️ CONFIG</h1>", unsafe_allow_html=True)
-        api_key = st.text_input("LlamaCloud API Key", type="password", help="Get your key from cloud.llamaindex.ai")
+        llama_key = st.text_input("LlamaCloud API Key", type="password", help="cloud.llamaindex.ai")
+        google_key = st.text_input("Google Gemini API Key", type="password", help="aistudio.google.com")
         
         st.divider()
         st.subheader("📂 Document Category")
@@ -320,11 +368,11 @@ def main():
             )
             
         if st.session_state.audit_logs:
-            with st.expander("📜 Auto-Fix Audit Log"):
+            with st.expander("📜 Visual Audit Log"):
                 st.markdown('<div class="log-container">' + "<br>".join(st.session_state.audit_logs) + '</div>', unsafe_allow_html=True)
 
     st.markdown("<h1 style='text-align: center;'>🇮🇳 Legal Digitizer <span style='color: #3b82f6; font-size: 0.5em;'>PRO</span></h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #94a3b8;'>Hybrid AI Extraction: Auto-Pilot + Human Oversight</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #94a3b8;'>Visual AI Judge: LlamaParse + Gemini 1.5 Vision</p>", unsafe_allow_html=True)
 
     # Tab handling for logical flow
     tabs = ["📤 PROCESS", "🔍 REVIEW DASHBOARD"]
@@ -337,21 +385,21 @@ def main():
             files = st.file_uploader("Drop your scans here (PDF, JPG, PNG)", accept_multiple_files=True)
         with col_info:
             st.markdown("""
-            ### 🛡️ Hybrid Mode Active
-            - **Green Zone**: Auto-Fix (>85%)
-            - **Red Zone**: Auto-Delete (<40%)
-            - **Grey Zone**: Human Review (40-85%)
+            ### 👁️ Visual Judge Active
+            - **LlamaParse**: Text Extraction
+            - **Tesseract**: Spatial Mapping
+            - **Gemini 1.5**: Visual Arbitration
             """)
 
-        if st.button("🚀 START HYBRID DIGITIZATION", width="stretch"):
-            if not api_key:
-                st.error("LlamaCloud API Key is required to proceed.")
+        if st.button("🚀 START VISUAL DIGITIZATION", width="stretch"):
+            if not llama_key:
+                st.error("LlamaCloud API Key is required.")
                 st.stop()
             if not files:
                 st.warning("Please upload at least one file.")
                 st.stop()
             
-            parser = LlamaParse(api_key=api_key, result_type="markdown", user_prompt=PROMPT_LIBRARY[mode])
+            parser = LlamaParse(api_key=llama_key, result_type="markdown", user_prompt=PROMPT_LIBRARY[mode])
             temp_dir = tempfile.mkdtemp()
             
             main_progress = st.progress(0)
@@ -376,8 +424,8 @@ def main():
                     docs = parser.load_data(path)
                     ai_text = "\n\n".join([d.text for d in docs])
                     
-                    # Hybrid Validation
-                    clean_text, errors, file_logs = process_hybrid_validation(path, ai_text, status_area)
+                    # Hybrid Validation with Vision Judge
+                    clean_text, errors, file_logs = process_hybrid_validation(path, ai_text, status_area, google_key)
                     st.session_state.audit_logs.extend([f"<b>--- {f.name} ---</b>"] + file_logs)
                     
                     if errors:
@@ -398,10 +446,10 @@ def main():
                 main_progress.progress((i+1)/len(files))
                 file_status.empty()
             
-            # CRITICAL FIX: Refresh page to show download buttons and review tabs
+            # Refresh page to show download buttons and review tabs
             st.rerun()
 
-        # MAIN PAGE DOWNLOAD (For Visibility)
+        # MAIN PAGE DOWNLOAD
         if st.session_state.processed_data and not st.session_state.review_queue:
             st.success("✅ All files processed successfully!")
             zip_buffer = io.BytesIO()
@@ -432,7 +480,7 @@ def main():
             
             with c_stat:
                 if errors:
-                    st.metric("Grey Zone Items", f"{st.session_state.err_idx + 1}/{len(errors)}")
+                    st.metric("Review Items", f"{st.session_state.err_idx + 1}/{len(errors)}")
                 else:
                     st.success("Clean!")
 
@@ -461,7 +509,7 @@ def main():
                     st.markdown("### 🛠️ Review Required")
                     
                     if curr_err["word"] == "SYSTEM_FAILURE":
-                        st.warning("The Validation System crashed on this file (likely Tesseract missing).")
+                        st.warning("The Validation System crashed on this file.")
                         st.info("Manual check required.")
                         if st.button("Accept AI Output Anyway", width="stretch"):
                             st.session_state.processed_data[sel_file] = clean_final_output(item["text"])

@@ -6,3 +6,4 @@ python-dotenv
 pytesseract
 thefuzz
 pillow
+google-generativeai
