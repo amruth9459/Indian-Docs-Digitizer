@@ -25,7 +25,7 @@ except ImportError:
     POPPLER_INSTALLED = False
 
 st.set_page_config(
-    page_title="Legal Digitizer Pro", 
+    page_title="Legal Digitizer Pro: Hybrid", 
     page_icon="⚖️", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -104,6 +104,16 @@ st.markdown("""
         margin-bottom: 10px;
         border-left: 5px solid #3b82f6;
     }
+    .log-container {
+        background: rgba(15, 23, 42, 0.5);
+        border-radius: 5px;
+        padding: 10px;
+        font-family: monospace;
+        font-size: 0.85em;
+        max-height: 200px;
+        overflow-y: auto;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+    }
 
     /* Fixed Height Image Container */
     div.stImage > img {
@@ -120,6 +130,7 @@ st.markdown("""
 if "review_queue" not in st.session_state: st.session_state.review_queue = []
 if "processed_data" not in st.session_state: st.session_state.processed_data = {}
 if "active_tab" not in st.session_state: st.session_state.active_tab = "📤 PROCESS"
+if "audit_logs" not in st.session_state: st.session_state.audit_logs = []
 
 # 2. THE BRAIN: NOISE-CANCELING PROMPTS
 PROMPT_LIBRARY = {
@@ -187,20 +198,23 @@ def clean_final_output(text):
     
     return cleaned
 
-# 4. MULTI-PAGE VALIDATION
-def validate_multipage(file_path, ai_text, status_placeholder):
+# 4. HYBRID VALIDATION ENGINE (3-ZONE LOGIC)
+def process_hybrid_validation(file_path, ai_text, status_placeholder):
     """
-    Returns: (is_clean, error_details)
+    Returns: (final_text, manual_review_items, logs)
     """
-    status_placeholder.markdown('<div class="status-container">🔍 Running Multi-Page Cross-Examination...</div>', unsafe_allow_html=True)
-    error_details = []
+    status_placeholder.markdown('<div class="status-container">🔍 Running Hybrid Cross-Examination...</div>', unsafe_allow_html=True)
+    manual_review_items = []
+    logs = []
+    final_text = ai_text
+    
     try:
         if file_path.lower().endswith(".pdf"):
             pages = convert_from_path(file_path)
         else:
             pages = [Image.open(file_path)]
     except:
-        return True, [] 
+        return ai_text, [], ["OCR Engine Failed to load image."]
 
     # Build Ground Truth
     full_document_ocr = [] 
@@ -215,9 +229,9 @@ def validate_multipage(file_path, ai_text, status_placeholder):
                     "box": (data['left'][i], data['top'][i], data['width'][i], data['height'][i])
                 })
 
-    # Check Hallucinations
-    raw_text_blob = " ".join([item["text"] for item in full_document_ocr])
-    stopwords = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT", "APPLICANT", "DEFENDANT", "COUNSEL", "ADVOCATE", "HYDERABAD", "TRIBUNAL", "ORDER", "OFFICE"]
+    raw_words_list = [item["text"] for item in full_document_ocr]
+    raw_text_blob = " ".join(raw_words_list)
+    stopwords = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT", "APPLICANT", "DEFENDANT", "COUNSEL", "ADVOCATE", "HYDERABAD", "TRIBUNAL", "ORDER", "OFFICE", "PAGE"]
     
     ai_words = set(re.findall(r'\b[A-Z][a-z]{2,}\b', ai_text))
     ai_words.update(set(re.findall(r'\b[A-Z]{3,}\b', ai_text)))
@@ -226,25 +240,37 @@ def validate_multipage(file_path, ai_text, status_placeholder):
         clean_word = suspect_word.strip(".,;:").upper()
         if clean_word in stopwords: continue
         
-        if fuzz.partial_ratio(suspect_word.lower(), raw_text_blob.lower()) < 80:
-            # Find closest visual match location
-            best_match = None
-            best_score = 0
-            for ocr_item in full_document_ocr:
-                score = fuzz.ratio(suspect_word.lower(), ocr_item["text"].lower())
-                if score > best_score:
-                    best_score = score
-                    best_match = ocr_item
+        # Check if word is missing or distorted
+        if fuzz.partial_ratio(suspect_word.lower(), raw_text_blob.lower()) < 85:
+            # Find Best Match in Scan
+            match_word, score = process.extractOne(suspect_word, raw_words_list)
             
-            error_details.append({
-                "word": suspect_word,
-                "page": best_match["page"] if best_match and best_score > 40 else 0,
-                "suggested_fix": best_match["text"] if best_match else "[Unknown]",
-                "ocr_data": best_match,
-                "raw_text": raw_text_blob # Keep for fuzzy suggestions
-            })
+            # Find coordinates for the match
+            best_match = next((item for item in full_document_ocr if item["text"] == match_word), None)
+            
+            # --- THE HYBRID 3-ZONE LOGIC ---
+            if score > 85:
+                # ZONE 1: GREEN (Auto-Fix)
+                final_text = final_text.replace(suspect_word, match_word)
+                logs.append(f"✅ Auto-Fixed: '{suspect_word}' -> '{match_word}' ({score}%)")
+            
+            elif score < 40:
+                # ZONE 2: RED (Auto-Delete Ghost)
+                final_text = final_text.replace(suspect_word, "")
+                logs.append(f"👻 Auto-Deleted Ghost: '{suspect_word}'")
+            
+            else:
+                # ZONE 3: GREY (Human Review)
+                manual_review_items.append({
+                    "word": suspect_word,
+                    "page": best_match["page"] if best_match else 0,
+                    "suggested_fix": match_word if best_match else "[Unknown]",
+                    "match_score": score,
+                    "ocr_data": best_match
+                })
+                logs.append(f"⚠️ Flagged for Review: '{suspect_word}' vs '{match_word}' ({score}%)")
 
-    return (len(error_details) == 0), error_details
+    return final_text, manual_review_items, logs
 
 # 5. CROP & ZOOM HIGHLIGHTER
 def get_zoomed_image(file_path, page_idx, target_box=None):
@@ -289,9 +315,13 @@ def main():
                 mime="application/zip",
                 width="stretch"
             )
+            
+        if st.session_state.audit_logs:
+            with st.expander("📜 Auto-Fix Audit Log"):
+                st.markdown('<div class="log-container">' + "<br>".join(st.session_state.audit_logs) + '</div>', unsafe_allow_html=True)
 
     st.markdown("<h1 style='text-align: center;'>🇮🇳 Legal Digitizer <span style='color: #3b82f6; font-size: 0.5em;'>PRO</span></h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #94a3b8;'>Zero-Hallucination AI Extraction for Complex Indian Records</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #94a3b8;'>Hybrid AI Extraction: Auto-Pilot + Human Oversight</p>", unsafe_allow_html=True)
 
     # Tab handling for logical flow
     tabs = ["📤 PROCESS", "🔍 REVIEW DASHBOARD"]
@@ -304,13 +334,13 @@ def main():
             files = st.file_uploader("Drop your scans here (PDF, JPG, PNG)", accept_multiple_files=True)
         with col_info:
             st.markdown("""
-            ### 🛡️ Paranoid Mode Active
-            - **Smart AI**: LlamaParse
-            - **Dumb OCR**: Tesseract
-            - **Validation**: Multi-Page Cross-Examination
+            ### 🛡️ Hybrid Mode Active
+            - **Green Zone**: Auto-Fix (>85%)
+            - **Red Zone**: Auto-Delete (<40%)
+            - **Grey Zone**: Human Review (40-85%)
             """)
 
-        if st.button("🚀 START DIGITIZATION", width="stretch"):
+        if st.button("🚀 START HYBRID DIGITIZATION", width="stretch"):
             if not api_key:
                 st.error("LlamaCloud API Key is required to proceed.")
                 st.stop()
@@ -324,6 +354,9 @@ def main():
             main_progress = st.progress(0)
             status_area = st.empty()
             
+            # Reset logs for new batch
+            st.session_state.audit_logs = []
+            
             for i, f in enumerate(files):
                 file_status = st.empty()
                 file_status.markdown(f'<div class="status-container">📁 Processing <b>{f.name}</b>...</div>', unsafe_allow_html=True)
@@ -333,27 +366,28 @@ def main():
                     file.write(f.getbuffer())
                 
                 try:
-                    # Granular Status Updates
+                    # AI Parsing
                     status_area.markdown('<div class="status-container">☁️ Uploading to LlamaCloud & AI Parsing...</div>', unsafe_allow_html=True)
                     docs = parser.load_data(path)
                     ai_text = "\n\n".join([d.text for d in docs])
                     
-                    # Multi-Page Validation
-                    is_valid, error_list = validate_multipage(path, ai_text, status_area)
+                    # Hybrid Validation
+                    clean_text, errors, file_logs = process_hybrid_validation(path, ai_text, status_area)
+                    st.session_state.audit_logs.extend([f"<b>--- {f.name} ---</b>"] + file_logs)
                     
-                    if not is_valid:
-                        status_area.markdown(f'<div class="status-container" style="border-left-color: #ef4444;">⚠️ Hallucination Risk Detected! Flagging for review.</div>', unsafe_allow_html=True)
+                    if errors:
+                        status_area.markdown(f'<div class="status-container" style="border-left-color: #f59e0b;">⚠️ {len(errors)} items in Grey Zone. Flagging for review.</div>', unsafe_allow_html=True)
                         st.session_state.review_queue.append({
                             "name": f.name, 
                             "path": path, 
-                            "text": ai_text, 
-                            "errors": error_list
+                            "text": clean_text, 
+                            "errors": errors
                         })
-                        time.sleep(1) # Visual feedback
+                        time.sleep(1)
                     else:
-                        status_area.markdown('<div class="status-container" style="border-left-color: #10b981;">✨ Cleaning & Finalizing Output...</div>', unsafe_allow_html=True)
-                        clean_text = clean_final_output(ai_text)
-                        st.session_state.processed_data[f.name] = clean_text
+                        status_area.markdown('<div class="status-container" style="border-left-color: #10b981;">✨ All items Auto-Fixed/Clean. Finalizing...</div>', unsafe_allow_html=True)
+                        final_clean = clean_final_output(clean_text)
+                        st.session_state.processed_data[f.name] = final_clean
                         os.remove(path)
                         time.sleep(0.5)
                         
@@ -399,7 +433,7 @@ def main():
             
             with c_stat:
                 if errors:
-                    st.metric("Error Progress", f"{st.session_state.err_idx + 1}/{len(errors)}")
+                    st.metric("Grey Zone Items", f"{st.session_state.err_idx + 1}/{len(errors)}")
                 else:
                     st.success("Clean!")
 
@@ -411,7 +445,7 @@ def main():
                 
                 # --- LEFT: THE VISUAL PROOF ---
                 with col_left:
-                    st.markdown(f"**📍 Visual Context (Page {curr_err['page']+1})**")
+                    st.markdown(f"**📍 Page {curr_err['page']+1}** (Match Confidence: `{curr_err['match_score']}%`)")
                     box = curr_err["ocr_data"]["box"] if curr_err["ocr_data"] else None
                     img = get_zoomed_image(item["path"], curr_err["page"], box)
                     if img:
@@ -421,7 +455,8 @@ def main():
 
                 # --- RIGHT: THE FIX WIZARD ---
                 with col_right:
-                    st.markdown("### 🛠️ Fix This")
+                    st.markdown("### 🛠️ Grey Zone Conflict")
+                    st.info("The Auto-Pilot is unsure. Please verify this match.")
                     st.error(f"AI Read: **{curr_err['word']}**")
                     
                     # Context Snippet
@@ -433,34 +468,15 @@ def main():
                     st.markdown("#### Select Correction:")
                     
                     # Options
-                    options = []
-                    if curr_err["suggested_fix"] != "[Unknown]":
-                        options.append(f"Replace with: '{curr_err['suggested_fix']}' (Raw Scan)")
-                    
-                    # Common Legal Corrections
-                    if "Pega" in curr_err['word']: options.append("Pegasus Assets")
-                    if "Karnataka" in curr_err['word']: options.append("Harsha")
-                    
-                    options.append(f"Keep: '{curr_err['word']}' (Ignore)")
-                    options.append("Mark as [ILLEGIBLE]")
+                    options = [
+                        f"Accept Scan: '{curr_err['suggested_fix']}'",
+                        f"Keep AI: '{curr_err['word']}'",
+                        "Mark as [ILLEGIBLE]",
+                        "Delete (Noise)"
+                    ]
                     
                     choice = st.radio("Action:", options, key=f"rad_{sel_file}_{st.session_state.err_idx}", index=None)
-                    
                     manual = st.text_input("Or type correction:", key=f"man_{sel_file}_{st.session_state.err_idx}")
-                    
-                    # APPLY LOGIC
-                    final_val = None
-                    if manual: 
-                        final_val = manual
-                    elif choice:
-                        if "Replace with" in choice:
-                            final_val = re.search(r"'(.*?)'", choice).group(1)
-                        elif "Keep:" in choice:
-                            final_val = curr_err["word"]
-                        elif "ILLEGIBLE" in choice:
-                            final_val = "[ILLEGIBLE]"
-                        else:
-                            final_val = choice
                     
                     # Navigation Handlers
                     c_prev, c_next = st.columns(2)
@@ -473,21 +489,35 @@ def main():
                     
                     with c_next:
                         if st.button("Confirm & Next ➡️", type="primary"):
-                            if final_val:
+                            final_val = None
+                            if manual: 
+                                final_val = manual
+                            elif choice:
+                                if "Accept Scan" in choice:
+                                    final_val = curr_err['suggested_fix']
+                                elif "Keep AI" in choice:
+                                    final_val = curr_err["word"]
+                                elif "Delete" in choice:
+                                    final_val = ""
+                                elif "ILLEGIBLE" in choice:
+                                    final_val = "[ILLEGIBLE]"
+                            
+                            if final_val is not None:
                                 item["text"] = item["text"].replace(curr_err["word"], final_val)
                                 if st.session_state.err_idx < len(errors) - 1:
                                     st.session_state.err_idx += 1
                                     st.rerun()
                                 else:
-                                    st.success("All errors checked!")
+                                    st.success("File Verified!")
                                     st.session_state.show_save = True
+                                    st.rerun()
                             else:
                                 st.warning("Please select a correction or type one.")
 
                     # SAVE BUTTON
                     if st.session_state.get("show_save"):
                         st.divider()
-                        if st.button("💾 SAVE FINAL DOCUMENT", width="stretch"):
+                        if st.button("💾 SAVE VERIFIED DOCUMENT", width="stretch"):
                             st.session_state.processed_data[sel_file] = clean_final_output(item["text"])
                             st.session_state.review_queue = [x for x in q if x["name"] != sel_file]
                             st.session_state.err_idx = 0
