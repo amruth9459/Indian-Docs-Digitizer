@@ -192,7 +192,7 @@ with tab1:
                 tmp.write(f.getbuffer())
                 path = tmp.name
             
-            res, manual, logs = run_scaled_pipeline(path, lk, gk, live_window=live_view)
+            res, manual, logs = run_scaled_pipeline(path, lk, gk, live_view=live_view)
             
             if manual:
                 st.session_state.review_queue.append({"name": f.name, "text": res, "items": manual})
