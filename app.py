@@ -17,19 +17,13 @@ import time
 
 # 1. SYSTEM SETUP
 nest_asyncio.apply()
-st.set_page_config(page_title="Visual Judge Pro", page_icon="👁️", layout="wide")
+st.set_page_config(page_title="Forensic Digitizer", page_icon="⚖️", layout="wide")
 
-# Custom CSS
+# CSS
 st.markdown("""
     <style>
-        .judge-card {
-            background-color: #262730;
-            padding: 15px;
-            border-radius: 10px;
-            border-left: 5px solid #FF4B4B;
-            margin-bottom: 10px;
-        }
-        .stButton>button { width: 100%; border-radius: 5px; font-weight: bold; }
+        .judge-card { border-left: 5px solid #FF4B4B; background: #262730; padding: 10px; }
+        .stButton>button { font-weight: bold; border-radius: 5px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -41,41 +35,64 @@ PROMPT_LIBRARY = {
     "🧩 Evidence": "Output Grids as Markdown Tables.",
 }
 
-# 3. SAFETY LOGIC
-def is_bad_correction(original, proposal):
-    if len(original) > 4 and len(proposal) < 3: return True
-    if original.isalpha() and not proposal.replace(" ", "").isalpha(): return True
-    return False
+# 3. CONTENT FILTER (Blocks Illegible/Garbage)
+def is_valid_content(word):
+    # 1. Block purely special char strings (e.g. "....", "---")
+    if not any(c.isalnum() for c in word):
+        return False
+    # 2. Block weird single chars (except a, I, &)
+    if len(word) == 1 and word not in ['a', 'A', 'I', '&']:
+        return False
+    # 3. Block very long nonsense (e.g. "lIlIlIlIlI")
+    if len(word) > 20 and " " not in word:
+        return False
+    return True
 
-# 4. THE VISION JUDGE
-def consult_gemini_vision(image_crop, option_a, option_b, api_key):
+# 4. THE FORENSIC VISION JUDGE (Anti-Hallucination)
+def consult_gemini_vision(image_crop, ai_guess, scan_guess, api_key):
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # THIS PROMPT IS THE KEY FIX
         prompt = f"""
-        Read the text in this image crop EXACTLY.
-        Context: Legal Document.
-        Option A: "{option_a}"
-        Option B: "{option_b}"
-        Output ONLY the text you see.
+        You are a Forensic Document Examiner.
+        
+        Task: Transcribe the text in this image crop EXACTLY as it appears.
+        
+        Context:
+        - Input A (AI Guess): "{ai_guess}" <- This is often a hallucination (a lie).
+        - Input B (Scan Guess): "{scan_guess}" <- This is often messy but honest.
+        
+        RULES:
+        1. If the image shows broken text like "Pegasu", DO NOT write "Pega Systems". Write "Pegasu".
+        2. Do NOT correct typos. Do NOT expand abbreviations.
+        3. If the image is unreadable noise, output "[ILLEGIBLE]".
+        4. If Input A is a completely different word than the image (hallucination), REJECT IT.
+        
+        Output ONLY the text visible in the image.
         """
+        
         response = model.generate_content([prompt, image_crop])
         return response.text.strip()
     except:
-        return option_a
+        return scan_guess # Fallback to Scan (Safer than AI)
 
 # 5. CORE PROCESSOR
 def process_file(file_path, api_key_llama, api_key_google, live_view_container):
     logs = []
+    
     with live_view_container.container():
-        st.info("🧠 Reading document structure...")
+        st.info("🧠 Parsing Document...")
+    
+    # Parse
     parser = LlamaParse(api_key=api_key_llama, result_type="markdown")
     docs = parser.load_data(file_path)
     ai_text = "\n\n".join([d.text for d in docs])
     final_text = ai_text
 
     with live_view_container.container():
-        st.info("📸 Mapping word coordinates...")
+        st.info("📸 Mapping Scan Coordinates...")
     
     try:
         if file_path.lower().endswith(".pdf"):
@@ -88,7 +105,7 @@ def process_file(file_path, api_key_llama, api_key_google, live_view_container):
             data = pytesseract.image_to_data(pg, output_type=Output.DICT)
             for i in range(len(data['text'])):
                 word = data['text'][i].strip()
-                if word:
+                if is_valid_content(word):
                     full_ocr_data.append({
                         "text": word, "page": pg_idx,
                         "box": (data['left'][i], data['top'][i], data['width'][i], data['height'][i]),
@@ -107,8 +124,12 @@ def process_file(file_path, api_key_llama, api_key_google, live_view_container):
     for word in ai_words:
         clean_word = word.strip(".,;:").upper()
         if clean_word in ignore: continue
+        if not is_valid_content(clean_word): continue
         
+        # Conflict Detected?
         if fuzz.partial_ratio(word.lower(), raw_scan_text.lower()) < 85:
+            
+            # Find closest visual match
             best_match = None
             best_score = 0
             for item in full_ocr_data:
@@ -119,28 +140,30 @@ def process_file(file_path, api_key_llama, api_key_google, live_view_container):
             
             if best_match:
                 x, y, w, h = best_match["box"]
-                crop = best_match["img"].crop((max(0, x-10), max(0, y-10), x+w+10, y+h+10))
+                # Tight crop to focus attention
+                crop = best_match["img"].crop((max(0, x-5), max(0, y-5), x+w+5, y+h+5))
                 
                 with live_view_container.container():
                     c1, c2 = st.columns([1, 2])
-                    with c1: st.image(crop, caption="Evidence", width=150)
+                    with c1: st.image(crop, caption="Evidence", width=120)
                     with c2:
-                        st.markdown(f"**Conflict Detected:**")
-                        st.code(f"AI:   {word}\nScan: {best_match['text']}")
-                        with st.spinner("Gemini is judging..."):
+                        st.markdown(f"**Investigating:** `{word}`")
+                        st.caption(f"Scan says: `{best_match['text']}`")
+                        
+                        with st.spinner("Forensic analysis..."):
                             verdict = consult_gemini_vision(crop, word, best_match["text"], api_key_google)
                         
+                        # LOGIC: Did the Judge reject the AI?
                         if verdict != word:
-                            if is_bad_correction(word, verdict):
-                                st.warning(f"🛡️ Safety Block: Kept '{word}'")
-                                logs.append(f"Safety: Kept '{word}'")
-                            else:
-                                st.markdown(f"✅ Verdict: **{verdict}**")
-                                final_text = final_text.replace(word, verdict)
-                                logs.append(f"Fixed: {word} -> {verdict}")
+                            # If verdict is closer to Scan than AI, we accept it
+                            final_text = final_text.replace(word, verdict)
+                            st.success(f"Correction: {verdict}")
+                            logs.append(f"Fixed: {word} -> {verdict}")
                         else:
-                            st.caption("Judge upheld AI.")
-                time.sleep(0.5)
+                            st.caption("AI upheld.")
+                
+                # Small delay for UI smoothness
+                time.sleep(0.2)
     
     return final_text, logs
 
@@ -150,75 +173,45 @@ def clean_final_output(text):
         text = text.split("[STAMP: CURRENT_PAGE_RAW_OCR_TEXT]")[0]
     return text.strip()
 
-# 7. SMART DOWNLOAD FUNCTION
+# 7. UI LAYOUT
 def render_download_button(location="sidebar"):
-    if not st.session_state.processed_data:
-        return
-
+    if not st.session_state.processed_data: return
     count = len(st.session_state.processed_data)
     
-    # CASE 1: SINGLE FILE -> Direct Markdown Download
     if count == 1:
         filename, content = list(st.session_state.processed_data.items())[0]
         clean_name = os.path.splitext(filename)[0] + ".md"
-        
-        if location == "sidebar":
-            st.sidebar.download_button(
-                label=f"📥 Download {clean_name}",
-                data=content,
-                file_name=clean_name,
-                mime="text/markdown"
-            )
-        else:
-            st.download_button(
-                label=f"📥 DOWNLOAD {clean_name}",
-                data=content,
-                file_name=clean_name,
-                mime="text/markdown",
-                type="primary",
-                use_container_width=True
-            )
-
-    # CASE 2: MULTIPLE FILES -> Zip Download
+        btn_label = f"📥 Download {clean_name}"
+        mime_type = "text/markdown"
+        data = content
     else:
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for n, c in st.session_state.processed_data.items():
-                zf.writestr(os.path.splitext(n)[0]+".md", c)
-        
-        if location == "sidebar":
-            st.sidebar.download_button(
-                label=f"📥 Download All ({count} files)",
-                data=zip_buffer.getvalue(),
-                file_name="verified_docs.zip",
-                mime="application/zip"
-            )
-        else:
-            st.download_button(
-                label=f"📥 DOWNLOAD ALL ({count} FILES)",
-                data=zip_buffer.getvalue(),
-                file_name="verified_docs.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=True
-            )
+            for n, c in st.session_state.processed_data.items(): zf.writestr(os.path.splitext(n)[0]+".md", c)
+        btn_label = f"📥 Download All ({count} Files)"
+        mime_type = "application/zip"
+        data = zip_buffer.getvalue()
+        clean_name = "verified_docs.zip"
 
-# 8. UI LAYOUT
+    if location == "sidebar":
+        st.sidebar.download_button(btn_label, data, clean_name, mime_type)
+    else:
+        st.download_button(btn_label, data, clean_name, mime_type, type="primary", use_container_width=True)
+
 with st.sidebar:
     st.header("🔑 Credentials")
     llama_key = st.text_input("LlamaCloud Key", type="password")
     google_key = st.text_input("Gemini Key", type="password")
     mode = st.selectbox("Scenario", list(PROMPT_LIBRARY.keys()))
-    
     st.divider()
-    render_download_button(location="sidebar")
+    render_download_button("sidebar")
 
-st.title("👁️ Visual AI Judge")
-st.markdown("### Real-Time Forensic Digitization")
+st.title("👁️ Forensic Digitizer")
+st.markdown("### Strict Visual Verification")
 
 files = st.file_uploader("Upload Files", accept_multiple_files=True)
 
-if st.button("🚀 Start Live Session"):
+if st.button("🚀 Start Forensic Analysis"):
     if not llama_key or not google_key: st.error("Keys required"); st.stop()
     if not files: st.warning("Upload a file"); st.stop()
 
@@ -226,10 +219,7 @@ if st.button("🚀 Start Live Session"):
     progress_bar = st.progress(0)
     
     st.divider()
-    st.subheader("📺 Live Courtroom View")
     live_window = st.empty()
-    
-    # Reset data if new batch
     st.session_state.processed_data = {}
     
     for i, f in enumerate(files):
@@ -246,14 +236,11 @@ if st.button("🚀 Start Live Session"):
             
         progress_bar.progress((i+1)/len(files))
 
-    live_window.empty() 
-    
+    live_window.empty()
     st.divider()
-    st.success("✅ All Files Processed Successfully!")
+    st.success("✅ Analysis Complete")
     
-    # Show Smart Download Button (Main Area)
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
-        render_download_button(location="main")
-        
+        render_download_button("main")
     st.balloons()
