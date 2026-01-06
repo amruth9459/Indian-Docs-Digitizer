@@ -14,6 +14,7 @@ from PIL import Image
 from google import genai
 import time
 from collections import Counter
+from functools import lru_cache
 
 # 1. SYSTEM SETUP
 nest_asyncio.apply()
@@ -33,14 +34,24 @@ def safe_replace_entity(text, old_val, new_val):
 
 # 3. ENTITY EXTRACTION (Golden Truths)
 def extract_global_entities(full_text):
-    # Pattern focused on legal entity types common in Indian courts
     pattern = r'\b[A-Z][a-zA-Z0-9\.]+(?:\s+[A-Z][a-zA-Z0-9\.]+){0,4}\s+(?:Pvt\.\s+Ltd\.|Ltd\.|Pvt\s+Ltd|Bank|Corporation|Techniques|Technologies|Assets)\b'
     matches = re.findall(pattern, full_text)
     ignore = ["BEFORE THE", "HON'BLE COURT", "DEBTS RECOVERY", "MEMO FILED", "FILED ON"]
     candidates = [m for m in matches if m.upper() not in ignore]
     return [entity for entity, count in Counter(candidates).most_common(15)]
 
-# 4. THE STABLE FORENSIC JUDGE
+# 4. ON-DEMAND PAGE RENDERING (Zero-RAM Logic)
+@lru_cache(maxsize=3)
+def get_page_image(pdf_path, page_index):
+    """Renders a single page from PDF only when needed. Caches last 3 pages."""
+    try:
+        images = convert_from_path(pdf_path, first_page=page_index+1, last_page=page_index+1, dpi=200)
+        return images[0] if images else None
+    except Exception as e:
+        print(f"Error rendering page {page_index}: {e}")
+        return None
+
+# 5. THE STABLE FORENSIC JUDGE
 def consult_gemini_forensic(image_crop, ai_guess, scan_guess, api_key):
     try:
         client = genai.Client(api_key=api_key)
@@ -75,46 +86,47 @@ def consult_gemini_forensic(image_crop, ai_guess, scan_guess, api_key):
     except Exception as e:
         return f"[MANUAL_REVIEW_REQUIRED: {str(e)[:15]}]"
 
-# 5. SCALED PIPELINE (Batch-Based)
+# 6. SCALED PIPELINE (Zero-RAM Edition)
 def run_scaled_pipeline(file_path, lk, gk, live_view):
     logs = []
     
-    # STEP 1: PARSING (LlamaParse handles large files better than raw OCR)
+    # STEP 1: PARSING
     live_view.info("🧠 Step 1: LlamaParse Deep Analysis...")
     parser = LlamaParse(api_key=lk, result_type="markdown")
     docs = parser.load_data(file_path)
     final_text = "\n\n".join([d.text for d in docs])
     
-    # Build Knowledge Base
     golden_truths = extract_global_entities(final_text)
     logs.append(f"Knowledge Base: Found {len(golden_truths)} verified entities.")
 
-    # STEP 2: BATCHED OCR MAPPING
-    live_view.info("📸 Step 2: Batched Spatial Mapping (Memory Optimized)...")
+    # STEP 2: LIGHTWEIGHT SPATIAL MAPPING (No Images Stored)
+    live_view.info("📸 Step 2: Spatial Mapping (Zero-RAM Mode)...")
     
-    # Get page count without loading images
     info = pdfinfo_from_path(file_path)
     total_pages = info["Pages"]
     
     full_ocr_data = []
-    # Process in 5-page batches to prevent RAM crashes
     batch_size = 5
+    
     for start in range(1, total_pages + 1, batch_size):
         end = min(start + batch_size - 1, total_pages)
-        live_view.caption(f"Reading ink data: Pages {start}-{end} of {total_pages}...")
+        live_view.caption(f"Mapping coordinates: Pages {start}-{end} of {total_pages}...")
         
+        # We still render batches for OCR, but we DELETE the images immediately
         batch_pages = convert_from_path(file_path, first_page=start, last_page=end, dpi=200)
         
-        for pg_idx, pg in enumerate(batch_pages):
+        for i, pg in enumerate(batch_pages):
+            actual_page_idx = (start - 1) + i
             data = pytesseract.image_to_data(pg, output_type=Output.DICT)
             for j, word in enumerate(data['text']):
                 if len(word.strip()) > 2:
                     full_ocr_data.append({
                         "text": word, 
-                        "box": (data['left'][j], data['top'][j], data['width'][j], data['height'][j]), 
-                        "img": pg.copy() # Store copy, allow original to be garbage collected
+                        "box": (data['left'][j], data['top'][j], data['width'][j], data['height'][j]),
+                        "page": actual_page_idx
+                        # NO IMAGE STORED HERE
                     })
-        del batch_pages # Clear batch from RAM
+        del batch_pages # Free RAM immediately
 
     # STEP 3: CONTEXTUAL AUDIT
     live_view.info("⚖️ Step 3: Forensic Judicial Audit...")
@@ -123,19 +135,22 @@ def run_scaled_pipeline(file_path, lk, gk, live_view):
     
     manual_needed = []
     
+    # Sort entities to try and process sequentially (though they are scattered)
+    # Actually, we process by entity, so we might jump around pages. 
+    # The LRU cache handles the jumping.
+    
     for word in ai_entities:
         if word.upper() in ["BEFORE", "COURT", "INDIA", "STAMP", "DATE", "MEMO", "THE", "AND"]: continue
         
-        # Conflict Detection
         if fuzz.partial_ratio(word.lower(), raw_blob.lower()) < 80:
             
-            # A. Check Knowledge Base First (Cheapest & Most Reliable)
+            # A. Knowledge Base Check
             match_truth, score = process.extractOne(word, golden_truths) if golden_truths else (None, 0)
             if score > 90:
                 final_text = safe_replace_entity(final_text, word, match_truth)
                 continue
             
-            # B. Consult Forensic Judge
+            # B. Forensic Judge
             best_match = None
             best_score = 0
             for item in full_ocr_data:
@@ -145,20 +160,25 @@ def run_scaled_pipeline(file_path, lk, gk, live_view):
                     best_match = item
             
             if best_match:
-                x, y, w, h = best_match["box"]
-                crop = best_match["img"].crop((max(0, x-10), max(0, y-10), x+w+10, y+h+10))
+                # RE-RENDER PAGE ON DEMAND
+                pg_idx = best_match["page"]
+                pg_img = get_page_image(file_path, pg_idx)
                 
-                verdict = consult_gemini_forensic(crop, word, best_match["text"], gk)
-                
-                if "[ILLEGIBLE]" in verdict or "[MANUAL" in verdict:
-                    manual_needed.append({"word": word, "crop": crop, "page": best_match.get("page", 0)})
-                else:
-                    final_text = safe_replace_entity(final_text, word, verdict)
-                    logs.append(f"Verified: {word} -> {verdict}")
+                if pg_img:
+                    x, y, w, h = best_match["box"]
+                    crop = pg_img.crop((max(0, x-10), max(0, y-10), x+w+10, y+h+10))
+                    
+                    verdict = consult_gemini_forensic(crop, word, best_match["text"], gk)
+                    
+                    if "[ILLEGIBLE]" in verdict or "[MANUAL" in verdict:
+                        manual_needed.append({"word": word, "crop": crop, "page": pg_idx})
+                    else:
+                        final_text = safe_replace_entity(final_text, word, verdict)
+                        logs.append(f"Verified: {word} -> {verdict}")
 
     return final_text, manual_needed, logs
 
-# 6. UI
+# 7. UI
 tab1, tab2 = st.tabs(["🚀 Scaled Pipeline", "🔍 Manual Review"])
 
 with st.sidebar:
