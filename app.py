@@ -11,7 +11,7 @@ from thefuzz import fuzz, process
 from llama_parse import LlamaParse
 from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image
-import google.generativeai as genai
+from google import genai
 import time
 from collections import Counter
 
@@ -43,8 +43,7 @@ def extract_global_entities(full_text):
 # 4. THE STABLE FORENSIC JUDGE
 def consult_gemini_forensic(image_crop, ai_guess, scan_guess, api_key):
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = genai.Client(api_key=api_key)
         
         prompt = f"""
         PIXEL-ONLY TRANSCRIPTION TASK:
@@ -62,7 +61,10 @@ def consult_gemini_forensic(image_crop, ai_guess, scan_guess, api_key):
         
         for attempt in range(3):
             try:
-                response = model.generate_content([prompt, image_crop])
+                response = client.models.generate_content(
+                    model='gemini-1.5-flash',
+                    contents=[prompt, image_crop]
+                )
                 return response.text.strip()
             except Exception as e:
                 if "429" in str(e): 
@@ -174,13 +176,13 @@ with st.sidebar:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zf:
                 for n, c in st.session_state.processed_data.items(): zf.writestr(n+".md", c)
-            st.download_button("� Download All (ZIP)", zip_buffer.getvalue(), "verified_docs.zip")
+            st.download_button("📥 Download All (ZIP)", zip_buffer.getvalue(), "verified_docs.zip")
 
 with tab1:
     st.subheader("Process Large Documents (100+ Pages)")
     files = st.file_uploader("Upload Legal Bundles (PDF)", accept_multiple_files=True)
     
-    if st.button("� Run Scaled Analysis"):
+    if st.button("🔥 Run Scaled Analysis"):
         if not lk or not gk: st.error("Keys required!"); st.stop()
         
         live_view = st.empty()
