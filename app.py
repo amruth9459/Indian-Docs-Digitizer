@@ -17,7 +17,7 @@ from collections import Counter
 
 # 1. SYSTEM SETUP
 nest_asyncio.apply()
-st.set_page_config(page_title="Forensic Stable Digitizer", page_icon="⚖️", layout="wide")
+st.set_page_config(page_title="Forensic Guardrail Digitizer", page_icon="⚖️", layout="wide")
 
 # Custom CSS for Live View
 st.markdown("""
@@ -47,31 +47,35 @@ def extract_global_entities(full_text):
     counts = Counter(candidates)
     return [entity for entity, count in counts.items()]
 
-# 3. STABLE JUDGE WITH BACKOFF
-def consult_gemini_stable(image_crop, ai_guess, scan_guess, api_key):
+# 3. UPDATED FORENSIC JUDGE (Strict Constraints)
+def consult_gemini_forensic(image_crop, ai_guess, scan_guess, api_key):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-1.5-flash')
     
+    # SYSTEM PROMPT: Hostile to guesses, strictly forensic
     prompt = f"""
-    TRANSCRIPTION TASK:
-    AI Proposal: "{ai_guess}"
-    OCR Scan: "{scan_guess}"
+    FORENSIC TASK: Transcribe ONLY the text visible in this image.
+    
     RULES:
-    1. If the text is physically unreadable/faded, output exactly "[ILLEGIBLE]".
-    2. If it is in another language (Telugu/Hindi), transcribe it exactly.
-    3. Output ONLY the text. No explanations.
+    1. DO NOT correct typos or "fix" names.
+    2. If the text is faded, write exactly what you see, even if it is a fragment (e.g., "Instrum").
+    3. AI HINT (Possibly Hallucinated): "{ai_guess}"
+    4. OCR HINT (Messy but Honest): "{scan_guess}"
+    5. If you cannot read it with 95% certainty, output "[ILLEGIBLE]".
+    6. DO NOT use generic names like 'Innovative Systems' unless they are clearly in the image.
+    
+    Output ONLY the transcribed text.
     """
     
-    # Retry logic: 3 attempts with exponential backoff
     for attempt in range(3):
         try:
             response = model.generate_content([prompt, image_crop])
             return response.text.strip()
         except Exception as e:
-            if "429" in str(e): # Rate limit error
-                time.sleep(2 * (attempt + 1)) # Wait 2s, 4s, 6s...
+            if "429" in str(e): 
+                time.sleep(5)
                 continue
-            return f"[JUDGE_UNAVAILABLE: {str(e)[:20]}]"
+            return f"[JUDGE_UNAVAILABLE]"
     return "[ILLEGIBLE]"
 
 # 4. SMART DOWNLOAD RENDERER
@@ -99,8 +103,8 @@ def render_download_button(location="sidebar"):
     else:
         st.download_button(btn_label, data, clean_name, mime_type, type="primary", use_container_width=True)
 
-# 5. MAIN PIPELINE
-def run_stable_pipeline(file_path, lk, gk, live_view):
+# 5. REFINED PIPELINE (Human-in-the-Loop Integration)
+def run_forensic_pipeline(file_path, lk, gk, live_view):
     logs = []
     
     with live_view.container():
@@ -132,7 +136,7 @@ def run_stable_pipeline(file_path, lk, gk, live_view):
     raw_blob = " ".join([x["text"] for x in full_ocr_data])
 
     with live_view.container():
-        st.info("⚖️ Round 3: Visual Audit (Stable Mode)...")
+        st.info("⚖️ Round 3: Visual Audit (Forensic Mode)...")
     
     ai_entities = set(re.findall(r'\b[A-Z][a-z]{2,}\b', final_text))
     manual_needed = []
@@ -169,7 +173,7 @@ def run_stable_pipeline(file_path, lk, gk, live_view):
                     with c2: 
                         st.caption(f"Judging: **{word}**")
                         with st.spinner("Consulting..."):
-                            verdict = consult_gemini_stable(crop, word, best_match["text"], gk)
+                            verdict = consult_gemini_forensic(crop, word, best_match["text"], gk)
                 # -----------------
 
                 if "[ILLEGIBLE]" in verdict or "JUDGE_UNAVAILABLE" in verdict or contains_foreign_script(verdict):
@@ -183,7 +187,7 @@ def run_stable_pipeline(file_path, lk, gk, live_view):
     return final_text, manual_needed, logs
 
 # 6. UI
-st.title("⚖️ Forensic Stable Digitizer")
+st.title("⚖️ Forensic Guardrail Digitizer")
 with st.sidebar:
     lk = st.text_input("LlamaCloud Key", type="password")
     gk = st.text_input("Gemini Key", type="password")
@@ -194,7 +198,7 @@ tab1, tab2 = st.tabs(["📤 Upload & Process", "🔍 Manual Review Queue"])
 
 with tab1:
     files = st.file_uploader("Upload Scans", accept_multiple_files=True)
-    if st.button("🚀 Run Stable Analysis"):
+    if st.button("🚀 Run Forensic Analysis"):
         if not lk or not gk:
             st.error("Keys required in sidebar.")
             st.stop()
@@ -210,7 +214,7 @@ with tab1:
                 tmp.write(f.getbuffer())
                 path = tmp.name
             
-            res, manual, logs = run_stable_pipeline(path, lk, gk, live_window)
+            res, manual, logs = run_forensic_pipeline(path, lk, gk, live_window)
             
             if manual:
                 st.session_state.review_queue.append({"name": f.name, "text": res, "items": manual})
