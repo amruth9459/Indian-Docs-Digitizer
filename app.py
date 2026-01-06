@@ -25,13 +25,13 @@ except ImportError:
     POPPLER_INSTALLED = False
 
 st.set_page_config(
-    page_title="Indian Doc Digitizer (Pro)", 
-    page_icon="🇮🇳", 
+    page_title="Legal Digitizer Pro", 
+    page_icon="⚖️", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- CUSTOM CSS FOR PREMIUM LOOK ---
+# --- CUSTOM CSS FOR PREMIUM LOOK & DASHBOARD ---
 st.markdown("""
 <style>
     /* Main Background */
@@ -104,6 +104,15 @@ st.markdown("""
         margin-bottom: 10px;
         border-left: 5px solid #3b82f6;
     }
+
+    /* Fixed Height Image Container */
+    div.stImage > img {
+        max-height: 700px;
+        object-fit: contain;
+        border-radius: 10px;
+        border: 2px solid rgba(255, 255, 255, 0.1);
+    }
+    .block-container {padding-top: 1rem;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -178,68 +187,81 @@ def clean_final_output(text):
     
     return cleaned
 
-# 4. THE "LIE DETECTOR" FUNCTION (With Coordinates)
-def validate_with_coordinates(image_path, ai_text, status_placeholder):
+# 4. MULTI-PAGE VALIDATION
+def validate_multipage(file_path, ai_text, status_placeholder):
     """
-    Returns: (is_clean, suspicious_list, raw_text, ocr_data)
+    Returns: (is_clean, error_details)
     """
-    status_placeholder.markdown('<div class="status-container">🔍 Running Tesseract Cross-Examination...</div>', unsafe_allow_html=True)
-    
-    # 1. Get Ground Truth with Coordinates
+    status_placeholder.markdown('<div class="status-container">🔍 Running Multi-Page Cross-Examination...</div>', unsafe_allow_html=True)
+    error_details = []
     try:
-        ocr_data = pytesseract.image_to_data(image_path, output_type=Output.DICT)
-        raw_text = " ".join([w for w in ocr_data['text'] if w.strip() != ""])
+        if file_path.lower().endswith(".pdf"):
+            pages = convert_from_path(file_path)
+        else:
+            pages = [Image.open(file_path)]
     except:
-        return True, [], "", {}
+        return True, [] 
 
-    # 2. Extract Proper Nouns (Capitalized words > 3 chars)
+    # Build Ground Truth
+    full_document_ocr = [] 
+    for page_idx, page_img in enumerate(pages):
+        data = pytesseract.image_to_data(page_img, output_type=Output.DICT)
+        n_boxes = len(data['text'])
+        for i in range(n_boxes):
+            word = data['text'][i].strip()
+            if word:
+                full_document_ocr.append({
+                    "text": word, "page": page_idx,
+                    "box": (data['left'][i], data['top'][i], data['width'][i], data['height'][i])
+                })
+
+    # Check Hallucinations
+    raw_text_blob = " ".join([item["text"] for item in full_document_ocr])
     stopwords = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT", "APPLICANT", "DEFENDANT", "COUNSEL", "ADVOCATE", "HYDERABAD", "TRIBUNAL", "ORDER", "OFFICE"]
     
     ai_words = set(re.findall(r'\b[A-Z][a-z]{2,}\b', ai_text))
     ai_words.update(set(re.findall(r'\b[A-Z]{3,}\b', ai_text)))
     
-    suspicious_list = []
-    
-    # 3. Cross-Examine
-    for word in ai_words:
-        clean_word = word.strip(".,;:").upper()
-        if clean_word in stopwords: 
-            continue
-            
-        # STRICT CHECK: Word must exist in raw text with 80% similarity
-        if fuzz.partial_ratio(word.lower(), raw_text.lower()) < 80:
-            suspicious_list.append(word)
-
-    is_clean = len(suspicious_list) == 0
-    return is_clean, suspicious_list, raw_text, ocr_data
-
-# 5. HELPER: DRAW HIGHLIGHTS ON IMAGE
-def highlight_suspects(image_path, ocr_data, suspect_words):
-    """
-    Draws red boxes on the image where words resemble the suspect words.
-    """
-    try:
-        if isinstance(image_path, str):
-            img = Image.open(image_path).convert("RGB")
-        else:
-            img = image_path.convert("RGB") # Handle PDF page object
-            
-        draw = ImageDraw.Draw(img)
+    for suspect_word in ai_words:
+        clean_word = suspect_word.strip(".,;:").upper()
+        if clean_word in stopwords: continue
         
-        n_boxes = len(ocr_data['text'])
-        for i in range(n_boxes):
-            word_on_page = ocr_data['text'][i].strip()
-            if not word_on_page: continue
+        if fuzz.partial_ratio(suspect_word.lower(), raw_text_blob.lower()) < 80:
+            # Find closest visual match location
+            best_match = None
+            best_score = 0
+            for ocr_item in full_document_ocr:
+                score = fuzz.ratio(suspect_word.lower(), ocr_item["text"].lower())
+                if score > best_score:
+                    best_score = score
+                    best_match = ocr_item
             
-            # Check if this word on page is similar to any suspect word
-            for suspect in suspect_words:
-                # If high similarity (e.g. AI: Pegasystems, Page: Pegasus), highlight it
-                if fuzz.ratio(suspect.lower(), word_on_page.lower()) > 60:
-                    (x, y, w, h) = (ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i])
-                    draw.rectangle([x, y, x + w, y + h], outline="red", width=4)
-                    
-        return img
-    except Exception as e:
+            error_details.append({
+                "word": suspect_word,
+                "page": best_match["page"] if best_match and best_score > 40 else 0,
+                "suggested_fix": best_match["text"] if best_match else "[Unknown]",
+                "ocr_data": best_match,
+                "raw_text": raw_text_blob # Keep for fuzzy suggestions
+            })
+
+    return (len(error_details) == 0), error_details
+
+# 5. CROP & ZOOM HIGHLIGHTER
+def get_zoomed_image(file_path, page_idx, target_box=None):
+    try:
+        if file_path.lower().endswith(".pdf"):
+            page = convert_from_path(file_path, first_page=page_idx+1, last_page=page_idx+1)[0]
+        else:
+            page = Image.open(file_path).convert("RGB")
+            
+        if target_box:
+            draw = ImageDraw.Draw(page)
+            (x, y, w, h) = target_box
+            # Draw Thick Red Box
+            draw.rectangle([x-5, y-5, x+w+5, y+h+5], outline="red", width=5)
+            
+        return page
+    except:
         return None
 
 # 6. MAIN APP INTERFACE
@@ -261,18 +283,18 @@ def main():
                 for n, c in st.session_state.processed_data.items():
                     zf.writestr(os.path.splitext(n)[0]+".md", c)
             st.download_button(
-                label="📥 Download Clean ZIP", 
+                label="📥 Download Final ZIP", 
                 data=zip_buffer.getvalue(), 
                 file_name="digitized_docs.zip", 
                 mime="application/zip",
                 use_container_width=True
             )
 
-    st.markdown("<h1 style='text-align: center;'>🇮🇳 Indian Document Digitizer <span style='color: #3b82f6; font-size: 0.5em;'>PRO</span></h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🇮🇳 Legal Digitizer <span style='color: #3b82f6; font-size: 0.5em;'>PRO</span></h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align: center; color: #94a3b8;'>Zero-Hallucination AI Extraction for Complex Indian Records</p>", unsafe_allow_html=True)
 
     # Tab handling for logical flow
-    tabs = ["📤 PROCESS", "🕵️ REVIEW"]
+    tabs = ["📤 PROCESS", "🔍 REVIEW DASHBOARD"]
     active_tab_index = tabs.index(st.session_state.active_tab)
     tab1, tab2 = st.tabs(tabs)
 
@@ -285,7 +307,7 @@ def main():
             ### 🛡️ Paranoid Mode Active
             - **Smart AI**: LlamaParse
             - **Dumb OCR**: Tesseract
-            - **Validation**: Cross-Examination enabled
+            - **Validation**: Multi-Page Cross-Examination
             """)
 
         if st.button("🚀 START DIGITIZATION", use_container_width=True):
@@ -316,15 +338,8 @@ def main():
                     docs = parser.load_data(path)
                     ai_text = "\n\n".join([d.text for d in docs])
                     
-                    status_area.markdown('<div class="status-container">🖼️ Preparing Image for Validation...</div>', unsafe_allow_html=True)
-                    if f.name.lower().endswith(".pdf"):
-                        images = convert_from_path(path, first_page=1, last_page=1)
-                        val_img = images[0]
-                    else:
-                        val_img = path
-                    
-                    # Lie Detector with Coordinates
-                    is_valid, suspicious_list, raw_text, ocr_data = validate_with_coordinates(val_img, ai_text, status_area)
+                    # Multi-Page Validation
+                    is_valid, error_list = validate_multipage(path, ai_text, status_area)
                     
                     if not is_valid:
                         status_area.markdown(f'<div class="status-container" style="border-left-color: #ef4444;">⚠️ Hallucination Risk Detected! Flagging for review.</div>', unsafe_allow_html=True)
@@ -332,10 +347,7 @@ def main():
                             "name": f.name, 
                             "path": path, 
                             "text": ai_text, 
-                            "errors": suspicious_list,
-                            "raw_text": raw_text,
-                            "ocr_data": ocr_data,
-                            "error": f"Found {len(suspicious_list)} suspicious entities."
+                            "errors": error_list
                         })
                         time.sleep(1) # Visual feedback
                     else:
@@ -358,8 +370,8 @@ def main():
             col_next1, col_next2 = st.columns(2)
             with col_next1:
                 if st.session_state.review_queue:
-                    if st.button("🕵️ GO TO REVIEW QUEUE", use_container_width=True):
-                        st.session_state.active_tab = "🕵️ REVIEW"
+                    if st.button("🔍 GO TO REVIEW DASHBOARD", use_container_width=True):
+                        st.session_state.active_tab = "🔍 REVIEW DASHBOARD"
                         st.rerun()
             with col_next2:
                 if st.session_state.processed_data:
@@ -368,127 +380,145 @@ def main():
     with tab2:
         if st.session_state.review_queue:
             q = st.session_state.review_queue
-            st.markdown(f"### ⚠️ {len(q)} Files Require Human Review")
             
-            sel = st.selectbox("Select File to Verify", [x["name"] for x in q])
-            item = next(x for x in q if x["name"] == sel)
+            # 1. Top Bar: File Selector & Progress
+            c_sel, c_stat = st.columns([3, 1])
+            with c_sel:
+                sel_file = st.selectbox("Current File:", [x["name"] for x in q], label_visibility="collapsed")
             
-            st.error(f"**Reason for Flag:** {item['error']}")
+            item = next(x for x in q if x["name"] == sel_file)
             
-            c_img, c_edit = st.columns([1, 1])
-            with c_img:
-                st.subheader("🔴 Smart Highlight")
-                try:
-                    if item["name"].lower().endswith(".pdf"):
-                        base_img = convert_from_path(item["path"], first_page=1, last_page=1)[0]
-                    else:
-                        base_img = item["path"]
-                    
-                    highlighted_img = highlight_suspects(base_img, item["ocr_data"], item["errors"])
-                    
-                    if highlighted_img:
-                        st.image(highlighted_img, use_container_width=True, caption="Red boxes show detected text matches")
-                    else:
-                        st.error("Could not generate highlights")
-                except Exception as e:
-                    st.error(f"Could not display image: {e}")
+            # Initialize Error Navigation
+            if "err_idx" not in st.session_state: st.session_state.err_idx = 0
+            if "file_tracker" not in st.session_state or st.session_state.file_tracker != sel_file:
+                st.session_state.err_idx = 0
+                st.session_state.file_tracker = sel_file
                 
-                st.divider()
-                with st.expander("🔍 Show Raw OCR (Dumb AI Layer)"):
-                    st.code(item.get("raw_text", "Not available"))
+            errors = item["errors"]
+            curr_err = errors[st.session_state.err_idx] if errors else None
+            
+            with c_stat:
+                if errors:
+                    st.metric("Error Progress", f"{st.session_state.err_idx + 1}/{len(errors)}")
+                else:
+                    st.success("Clean!")
 
-            with c_edit:
-                st.subheader("🔧 Smart Entity Repair")
-                st.info("Select the correct version of the flagged words below.")
-                
-                # We work on a copy of the text
-                current_text = item["text"]
-                
-                # If the Lie Detector found specific words
-                if item.get("errors"):
-                    for i, error_word in enumerate(item["errors"]):
-                        st.divider()
-                        
-                        # Show context snippet
-                        start_idx = current_text.find(error_word)
-                        if start_idx != -1:
-                            end_idx = start_idx + len(error_word)
-                            snippet = current_text[max(0, start_idx-30):min(len(current_text), end_idx+30)]
-                            snippet = snippet.replace("\n", " ")
-                            st.markdown(f"🔴 **Suspect Word:** `{error_word}`")
-                            st.caption(f"...{snippet}...")
-                        
-                        # Generate Intelligent Options
-                        options = []
-                        
-                        # Option A: What Tesseract saw in the raw text (Best Guess)
-                        raw_text_list = item["raw_text"].split()
-                        raw_matches = process.extract(error_word, raw_text_list, limit=3)
-                        for match, score in raw_matches:
-                            if match != error_word and match not in options:
-                                options.append(match)
-                                
-                        # Option B: Common Legal Corrections
-                        if "Pega" in error_word: options.append("Pegasus Assets")
-                        if "Karnataka" in error_word: options.append("Harsha")
-                        
-                        # Option C: The Original
-                        options.append(error_word + " (Keep Original)")
-                        
-                        # Option D: "Illegible"
-                        options.append(" [ILLEGIBLE] ")
+            st.divider()
 
-                        # UI: Radio Button for speed
-                        choice = st.radio(
-                            f"Correction for '{error_word}':", 
-                            options, 
-                            key=f"rad_{i}_{sel}",
-                            index=None
-                        )
-                        
-                        final_replacement = None
-                        if choice:
-                            if "Keep Original" in choice:
-                                final_replacement = error_word
-                            elif "[ILLEGIBLE]" in choice:
-                                final_replacement = "[ILLEGIBLE]"
+            # 2. Main Dashboard (Split View)
+            if curr_err:
+                col_left, col_right = st.columns([1.5, 1], gap="medium")
+                
+                # --- LEFT: THE VISUAL PROOF ---
+                with col_left:
+                    st.markdown(f"**📍 Visual Context (Page {curr_err['page']+1})**")
+                    box = curr_err["ocr_data"]["box"] if curr_err["ocr_data"] else None
+                    img = get_zoomed_image(item["path"], curr_err["page"], box)
+                    if img:
+                        st.image(img, use_container_width=True)
+                    else:
+                        st.warning("Preview unavailable")
+
+                # --- RIGHT: THE FIX WIZARD ---
+                with col_right:
+                    st.markdown("### 🛠️ Fix This")
+                    st.error(f"AI Read: **{curr_err['word']}**")
+                    
+                    # Context Snippet
+                    start = item["text"].find(curr_err["word"])
+                    if start != -1:
+                        snippet = item["text"][max(0, start-30):min(len(item["text"]), start+30)]
+                        st.caption(f"...{snippet}...")
+                    
+                    st.markdown("#### Select Correction:")
+                    
+                    # Options
+                    options = []
+                    if curr_err["suggest_fix"] != "[Unknown]":
+                        options.append(f"Replace with: '{curr_err['suggested_fix']}' (Raw Scan)")
+                    
+                    # Common Legal Corrections
+                    if "Pega" in curr_err['word']: options.append("Pegasus Assets")
+                    if "Karnataka" in curr_err['word']: options.append("Harsha")
+                    
+                    options.append(f"Keep: '{curr_err['word']}' (Ignore)")
+                    options.append("Mark as [ILLEGIBLE]")
+                    
+                    choice = st.radio("Action:", options, key=f"rad_{sel_file}_{st.session_state.err_idx}", index=None)
+                    
+                    manual = st.text_input("Or type correction:", key=f"man_{sel_file}_{st.session_state.err_idx}")
+                    
+                    # APPLY LOGIC
+                    final_val = None
+                    if manual: 
+                        final_val = manual
+                    elif choice:
+                        if "Replace with" in choice:
+                            final_val = re.search(r"'(.*?)'", choice).group(1)
+                        elif "Keep:" in choice:
+                            final_val = curr_err["word"]
+                        elif "ILLEGIBLE" in choice:
+                            final_val = "[ILLEGIBLE]"
+                        else:
+                            final_val = choice
+                    
+                    # Navigation Handlers
+                    c_prev, c_next = st.columns(2)
+                    
+                    with c_prev:
+                        if st.button("⬅️ Previous"):
+                            if st.session_state.err_idx > 0:
+                                st.session_state.err_idx -= 1
+                                st.rerun()
+                    
+                    with c_next:
+                        if st.button("Confirm & Next ➡️", type="primary"):
+                            if final_val:
+                                item["text"] = item["text"].replace(curr_err["word"], final_val)
+                                if st.session_state.err_idx < len(errors) - 1:
+                                    st.session_state.err_idx += 1
+                                    st.rerun()
+                                else:
+                                    st.success("All errors checked!")
+                                    st.session_state.show_save = True
                             else:
-                                final_replacement = choice
+                                st.warning("Please select a correction or type one.")
 
-                        # Manual Override
-                        manual_fix = st.text_input(f"Or type manually for '{error_word}':", key=f"man_{i}_{sel}")
-                        if manual_fix:
-                            final_replacement = manual_fix
-                        
-                        # Apply the fix to the text immediately
-                        if final_replacement and final_replacement != error_word:
-                            current_text = current_text.replace(error_word, final_replacement)
-                            st.success(f"Fixed: {error_word} ➡️ {final_replacement}")
-
+                    # SAVE BUTTON
+                    if st.session_state.get("show_save"):
+                        st.divider()
+                        if st.button("💾 SAVE FINAL DOCUMENT", use_container_width=True):
+                            st.session_state.processed_data[sel_file] = clean_final_output(item["text"])
+                            st.session_state.review_queue = [x for x in q if x["name"] != sel_file]
+                            st.session_state.err_idx = 0
+                            if "show_save" in st.session_state: del st.session_state.show_save
+                            if not st.session_state.review_queue:
+                                st.session_state.active_tab = "📤 PROCESS"
+                            st.rerun()
+                            
                 st.divider()
-                
-                # Global "Illegible" Button
                 if st.button("🚫 Mark Entire File as ILLEGIBLE", use_container_width=True):
-                    st.session_state.processed_data[sel] = "[FILE MARKED ILLEGIBLE BY HUMAN REVIEWER]"
-                    st.session_state.review_queue = [x for x in q if x["name"] != sel]
+                    st.session_state.processed_data[sel_file] = "[FILE MARKED ILLEGIBLE BY HUMAN REVIEWER]"
+                    st.session_state.review_queue = [x for x in q if x["name"] != sel_file]
+                    st.session_state.err_idx = 0
                     if not st.session_state.review_queue:
                         st.session_state.active_tab = "📤 PROCESS"
                     st.rerun()
 
-                st.markdown("### 📝 Final Verification")
-                final_text_display = st.text_area("Final Text Preview", value=clean_final_output(current_text), height=400)
-                
-                if st.button("✅ APPROVE & SAVE FILE", use_container_width=True):
-                    st.session_state.processed_data[sel] = final_text_display
-                    st.session_state.review_queue = [x for x in q if x["name"] != sel]
-                    if not st.session_state.review_queue:
-                        st.session_state.active_tab = "📤 PROCESS"
-                    st.rerun()
+            st.markdown("### 📝 Final Verification")
+            st.text_area("Full Text Preview", value=clean_final_output(item["text"]), height=300)
+
         else:
-            st.success("🎉 All files verified! Your queue is empty.")
-            if st.button("⬅️ BACK TO UPLOAD", use_container_width=True):
-                st.session_state.active_tab = "📤 PROCESS"
+            st.info("No errors detected in this file.")
+            if st.button("Mark as Done", use_container_width=True):
+                st.session_state.processed_data[sel_file] = clean_final_output(item["text"])
+                st.session_state.review_queue = [x for x in q if x["name"] != sel_file]
                 st.rerun()
+    else:
+        st.success("🎉 All documents verified and ready for download!")
+        if st.button("⬅️ BACK TO UPLOAD", use_container_width=True):
+            st.session_state.active_tab = "📤 PROCESS"
+            st.rerun()
 
 if __name__ == "__main__":
     main()
