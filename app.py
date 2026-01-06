@@ -287,7 +287,7 @@ def main():
                 data=zip_buffer.getvalue(), 
                 file_name="digitized_docs.zip", 
                 mime="application/zip",
-                use_container_width=True
+                width="stretch"
             )
 
     st.markdown("<h1 style='text-align: center;'>🇮🇳 Legal Digitizer <span style='color: #3b82f6; font-size: 0.5em;'>PRO</span></h1>", unsafe_allow_html=True)
@@ -310,7 +310,7 @@ def main():
             - **Validation**: Multi-Page Cross-Examination
             """)
 
-        if st.button("🚀 START DIGITIZATION", use_container_width=True):
+        if st.button("🚀 START DIGITIZATION", width="stretch"):
             if not api_key:
                 st.error("LlamaCloud API Key is required to proceed.")
                 st.stop()
@@ -318,7 +318,7 @@ def main():
                 st.warning("Please upload at least one file.")
                 st.stop()
             
-            parser = LlamaParse(api_key=api_key, result_type="markdown", parsing_instruction=PROMPT_LIBRARY[mode])
+            parser = LlamaParse(api_key=api_key, result_type="markdown", user_prompt=PROMPT_LIBRARY[mode])
             temp_dir = tempfile.mkdtemp()
             
             main_progress = st.progress(0)
@@ -370,7 +370,7 @@ def main():
             col_next1, col_next2 = st.columns(2)
             with col_next1:
                 if st.session_state.review_queue:
-                    if st.button("🔍 GO TO REVIEW DASHBOARD", use_container_width=True):
+                    if st.button("🔍 GO TO REVIEW DASHBOARD", width="stretch"):
                         st.session_state.active_tab = "🔍 REVIEW DASHBOARD"
                         st.rerun()
             with col_next2:
@@ -415,7 +415,7 @@ def main():
                     box = curr_err["ocr_data"]["box"] if curr_err["ocr_data"] else None
                     img = get_zoomed_image(item["path"], curr_err["page"], box)
                     if img:
-                        st.image(img, use_container_width=True)
+                        st.image(img, width="stretch")
                     else:
                         st.warning("Preview unavailable")
 
@@ -487,7 +487,7 @@ def main():
                     # SAVE BUTTON
                     if st.session_state.get("show_save"):
                         st.divider()
-                        if st.button("💾 SAVE FINAL DOCUMENT", use_container_width=True):
+                        if st.button("💾 SAVE FINAL DOCUMENT", width="stretch"):
                             st.session_state.processed_data[sel_file] = clean_final_output(item["text"])
                             st.session_state.review_queue = [x for x in q if x["name"] != sel_file]
                             st.session_state.err_idx = 0
@@ -497,7 +497,7 @@ def main():
                             st.rerun()
                             
                 st.divider()
-                if st.button("🚫 Mark Entire File as ILLEGIBLE", use_container_width=True):
+                if st.button("🚫 Mark Entire File as ILLEGIBLE", width="stretch"):
                     st.session_state.processed_data[sel_file] = "[FILE MARKED ILLEGIBLE BY HUMAN REVIEWER]"
                     st.session_state.review_queue = [x for x in q if x["name"] != sel_file]
                     st.session_state.err_idx = 0
@@ -507,7 +507,7 @@ def main():
 
             else:
                 st.info("No errors detected in this file.")
-                if st.button("Mark as Done", use_container_width=True):
+                if st.button("Mark as Done", width="stretch"):
                     st.session_state.processed_data[sel_file] = clean_final_output(item["text"])
                     st.session_state.review_queue = [x for x in q if x["name"] != sel_file]
                     st.rerun()
@@ -516,7 +516,7 @@ def main():
             st.text_area("Full Text Preview", value=clean_final_output(item["text"]), height=300)
         else:
             st.success("🎉 All documents verified and ready for download!")
-            if st.button("⬅️ BACK TO UPLOAD", use_container_width=True):
+            if st.button("⬅️ BACK TO UPLOAD", width="stretch"):
                 st.session_state.active_tab = "📤 PROCESS"
                 st.rerun()
 
