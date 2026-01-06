@@ -4,7 +4,6 @@ import tempfile
 import zipfile
 import io
 import nest_asyncio
-import shutil
 import re
 import pytesseract
 from pytesseract import Output
@@ -14,267 +13,175 @@ from pdf2image import convert_from_path
 from PIL import Image
 import google.generativeai as genai
 import time
-from collections import Counter
 
 # 1. SYSTEM SETUP
 nest_asyncio.apply()
-st.set_page_config(page_title="Contextual Forensic Digitizer", page_icon="⚖️", layout="wide")
-
-# CSS
-st.markdown("""
-    <style>
-        .judge-card { border-left: 5px solid #FF4B4B; background: #262730; padding: 10px; }
-        .stButton>button { font-weight: bold; border-radius: 5px; }
-    </style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Forensic Multilingual Digitizer", page_icon="⚖️", layout="wide")
 
 if "processed_data" not in st.session_state: st.session_state.processed_data = {}
+if "review_queue" not in st.session_state: st.session_state.review_queue = []
 
-# 2. PROMPTS
-PROMPT_LIBRARY = {
-    "⚖️ Legal": "Transcribe text exactly. Use visual context to read faded names.",
-    "🧩 Evidence": "Output Grids as Markdown Tables.",
-}
+# 2. LANGUAGE DETECTION HELPER
+def contains_foreign_script(text):
+    # Detects non-ASCII characters (common in Telugu/Hindi/etc)
+    return any(ord(char) > 127 for char in text)
 
-# 3. HELPER: CONTENT FILTER
-def is_valid_content(word):
-    if not any(c.isalnum() for c in word): return False
-    if len(word) == 1 and word not in ['a', 'A', 'I', '&']: return False
-    if len(word) > 20 and " " not in word: return False
-    return True
-
-# 4. HELPER: BAD CORRECTION CHECK
-def is_bad_correction(original, proposal):
-    if len(original) > 4 and len(proposal) < 3: return True
-    if original.isalpha() and not proposal.replace(" ", "").isalpha(): return True
-    return False
-
-# 5. NEW FEATURE: GLOBAL CONTEXT EXTRACTION
-def extract_global_entities(full_text):
-    """
-    Finds the 'Golden Truths' in the document.
-    Returns a list of high-confidence entities (e.g. 'Pegasus Assets', 'Instruments Techniques')
-    """
-    # Regex to find Capitalized Phrases (e.g. "Instruments Techniques Pvt Ltd")
-    # Matches words starting with Caps, allowing for abbreviations like "Pvt."
-    pattern = r'\b[A-Z][a-zA-Z0-9\.]+(?:\s+[A-Z][a-zA-Z0-9\.]+){1,}\b'
-    
-    matches = re.findall(pattern, full_text)
-    
-    # Filter out common headers
-    ignore = ["BEFORE THE", "HON'BLE COURT", "DEBTS RECOVERY", "MEMO FILED", "FOR THE", "AND THE", "IN THE MATTER", "FILED ON", "FILED BY"]
-    candidates = [m for m in matches if m.upper() not in ignore and len(m) > 5]
-    
-    # Count frequency. If it appears more than once, it's likely a Truth.
-    counts = Counter(candidates)
-    golden_truths = [entity for entity, count in counts.items()]
-    
-    return golden_truths
-
-# 6. VISION JUDGE
-def consult_gemini_vision(image_crop, ai_guess, scan_guess, api_key):
+# 3. THE MULTI-ROUND JUDGE
+def consult_gemini_forensic(image_crop, ai_guess, scan_guess, api_key):
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Determine if we need the multilingual prompt
+        is_multilingual = contains_foreign_script(scan_guess)
+        
         prompt = f"""
-        You are a Forensic Document Examiner.
-        Task: Transcribe the text in this image crop EXACTLY.
-        Context:
-        - Input A (AI): "{ai_guess}"
-        - Input B (Scan): "{scan_guess}"
-        RULES:
-        1. If image shows broken text like "Pegasu", write "Pegasu".
-        2. Do NOT expand abbreviations.
-        3. If unreadable, output "[ILLEGIBLE]".
-        Output ONLY the visible text.
+        TRANSCRIPTION TASK:
+        Image content: Document fragment.
+        AI Proposal: "{ai_guess}"
+        OCR Scan: "{scan_guess}"
+        
+        INSTRUCTIONS:
+        1. If you see Indian script (Telugu/Hindi), transcribe it exactly.
+        2. If the text is physically unreadable (faded/destroyed), output exactly "[ILLEGIBLE]".
+        3. Do NOT hallucinate names. If you only see "Pega", write "Pega".
+        4. Output ONLY the text.
         """
+        
         response = model.generate_content([prompt, image_crop])
         return response.text.strip()
     except:
-        return scan_guess
+        return "[ERROR_CALLING_JUDGE]"
 
-# 7. CORE PROCESSOR
-def process_file(file_path, api_key_llama, api_key_google, live_view_container):
+# 4. REPLACEMENT LOGIC (Prevents stuttering)
+def safe_replace_entity(text, old_val, new_val):
+    if not new_val or new_val == old_val: return text
+    # Prevents replacing "Pega" with "Pegasus" if "Pegasus" is already there
+    if new_val in text and old_val in new_val: return text
+    return re.sub(r'\b' + re.escape(old_val) + r'\b', new_val, text)
+
+# 5. MAIN PIPELINE
+def run_pipeline(file_path, lk, gk, live_view):
     logs = []
     
-    with live_view_container.container():
-        st.info("🧠 Parsing Document...")
-    
-    # Parse
-    parser = LlamaParse(api_key=api_key_llama, result_type="markdown")
+    live_view.info("🔄 Round 1: LlamaParse Intelligence...")
+    parser = LlamaParse(api_key=lk, result_type="markdown")
     docs = parser.load_data(file_path)
-    ai_text = "\n\n".join([d.text for d in docs])
-    final_text = ai_text
+    final_text = "\n\n".join([d.text for d in docs])
 
-    # --- STEP 1: BUILD KNOWLEDGE BASE ---
-    with live_view_container.container():
-        st.info("📚 Building Document Knowledge Base...")
+    live_view.info("🔄 Round 2: Tesseract Spatial Mapping...")
+    pages = convert_from_path(file_path, dpi=300) if file_path.lower().endswith(".pdf") else [Image.open(file_path)]
     
-    golden_truths = extract_global_entities(ai_text)
-    logs.append(f"Found {len(golden_truths)} Context Entities (e.g. '{golden_truths[0] if golden_truths else 'None'}')")
+    full_ocr_data = []
+    for pg_idx, pg in enumerate(pages):
+        data = pytesseract.image_to_data(pg, output_type=Output.DICT)
+        for i, word in enumerate(data['text']):
+            if len(word.strip()) > 1:
+                full_ocr_data.append({
+                    "text": word, "page": pg_idx, 
+                    "box": (data['left'][i], data['top'][i], data['width'][i], data['height'][i]), 
+                    "img": pg
+                })
+    raw_blob = " ".join([x["text"] for x in full_ocr_data])
 
-    # --- STEP 2: OCR MAPPING ---
-    try:
-        if file_path.lower().endswith(".pdf"):
-            pages = convert_from_path(file_path, dpi=300)
-        else:
-            pages = [Image.open(file_path)]
-            
-        full_ocr_data = []
-        for pg_idx, pg in enumerate(pages):
-            data = pytesseract.image_to_data(pg, output_type=Output.DICT)
-            for i in range(len(data['text'])):
-                word = data['text'][i].strip()
-                if is_valid_content(word):
-                    full_ocr_data.append({
-                        "text": word, "page": pg_idx,
-                        "box": (data['left'][i], data['top'][i], data['width'][i], data['height'][i]),
-                        "img": pg
-                    })
-        raw_scan_text = " ".join([x["text"] for x in full_ocr_data])
-    except Exception as e:
-        return ai_text, [f"OCR Error: {e}"]
+    live_view.info("🔄 Round 3: Visual Audit...")
+    ai_entities = set(re.findall(r'\b[A-Z][a-z]{2,}\b', final_text))
+    
+    manual_needed = []
 
-    # --- STEP 3: JUDGMENT LOOP ---
-    ignore = ["BEFORE", "THE", "AND", "BETWEEN", "DATE", "FILED", "MEMO", "HIGH", "COURT", "STAMP", "INDIA", "GOVERNMENT", "APPLICANT", "DEFENDANT", "COUNSEL", "ADVOCATE", "HYDERABAD", "TRIBUNAL", "ORDER"]
-    
-    ai_words = set(re.findall(r'\b[A-Z][a-z]{2,}\b', ai_text))
-    ai_words.update(set(re.findall(r'\b[A-Z]{3,}\b', ai_text)))
-    
-    for word in ai_words:
-        clean_word = word.strip(".,;:").upper()
-        if clean_word in ignore: continue
-        if not is_valid_content(clean_word): continue
+    for word in ai_entities:
+        if word.upper() in ["BEFORE", "COURT", "INDIA", "STAMP", "DATE"]: continue
         
-        # Conflict?
-        if fuzz.partial_ratio(word.lower(), raw_scan_text.lower()) < 85:
-            
-            # --- NEW: GLOBAL CONTEXT CHECK (The Shortcut) ---
-            # Before calling Gemini, check if this messy word matches a Golden Truth
-            context_match = process.extractOne(word, golden_truths)
-            if context_match and context_match[1] > 85:
-                # Example: AI saw "Pegasu_s", Context found "Pegasus Assets" (90% match)
-                # We trust the Context!
-                final_text = final_text.replace(word, context_match[0])
-                logs.append(f"📚 CONTEXT FIXED: '{word}' -> '{context_match[0]}' (Found elsewhere in doc)")
-                continue # Skip Vision Judge, we solved it!
-
-            # --- IF NO CONTEXT MATCH, CALL VISION JUDGE ---
+        if fuzz.partial_ratio(word.lower(), raw_blob.lower()) < 80:
+            # Find closest box to see what happened
             best_match = None
             best_score = 0
             for item in full_ocr_data:
-                score = fuzz.ratio(word.lower(), item["text"].lower())
-                if score > best_score:
-                    best_score = score
+                s = fuzz.ratio(word.lower(), item["text"].lower())
+                if s > best_score:
+                    best_score = s
                     best_match = item
             
             if best_match:
                 x, y, w, h = best_match["box"]
-                crop = best_match["img"].crop((max(0, x-5), max(0, y-5), x+w+5, y+h+5))
+                crop = best_match["img"].crop((max(0, x-10), max(0, y-10), x+w+10, y+h+10))
                 
-                with live_view_container.container():
-                    c1, c2 = st.columns([1, 2])
-                    with c1: st.image(crop, caption="Evidence", width=120)
-                    with c2:
-                        st.markdown(f"**Investigating:** `{word}`")
-                        
-                        with st.spinner("Forensic analysis..."):
-                            verdict = consult_gemini_vision(crop, word, best_match["text"], api_key_google)
-                        
-                        if verdict != word:
-                            if is_bad_correction(word, verdict):
-                                logs.append(f"🛡️ SAFETY: Kept '{word}'")
-                            else:
-                                final_text = final_text.replace(word, verdict)
-                                st.success(f"Correction: {verdict}")
-                                logs.append(f"👁️ VISION FIXED: {word} -> {verdict}")
-                        else:
-                            st.caption("AI upheld.")
-                time.sleep(0.1)
-    
-    return final_text, logs
+                verdict = consult_gemini_forensic(crop, word, best_match["text"], gk)
+                
+                # FLAG FOR HUMAN REVIEW IF:
+                # 1. Gemini says it's illegible
+                # 2. It's a foreign script Gemini isn't 100% sure about
+                # 3. AI and Judge completely disagree
+                if "[ILLEGIBLE]" in verdict or contains_foreign_script(verdict):
+                    manual_needed.append({"word": word, "verdict": verdict, "crop": crop, "page": best_match["page"]})
+                else:
+                    final_text = safe_replace_entity(final_text, word, verdict)
+                    logs.append(f"Fixed: {word} -> {verdict}")
 
-# 8. CLEANER
-def clean_final_output(text):
-    if "[STAMP: CURRENT_PAGE_RAW_OCR_TEXT]" in text:
-        text = text.split("[STAMP: CURRENT_PAGE_RAW_OCR_TEXT]")[0]
-    return text.strip()
+    return final_text, manual_needed, logs
 
-# 9. UI LAYOUT
-def render_download_button(location="sidebar"):
-    if not st.session_state.processed_data: return
-    count = len(st.session_state.processed_data)
-    
-    if count == 1:
-        filename, content = list(st.session_state.processed_data.items())[0]
-        clean_name = os.path.splitext(filename)[0] + ".md"
-        btn_label = f"📥 Download {clean_name}"
-        mime_type = "text/markdown"
-        data = content
-    else:
+# 6. UI
+st.title("⚖️ Forensic Human-in-the-Loop Digitizer")
+with st.sidebar:
+    lk = st.text_input("LlamaCloud Key", type="password")
+    gk = st.text_input("Gemini Key", type="password")
+    if st.session_state.processed_data:
+        st.divider()
+        st.success("Processing Complete")
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for n, c in st.session_state.processed_data.items(): zf.writestr(os.path.splitext(n)[0]+".md", c)
-        btn_label = f"📥 Download All ({count} Files)"
-        mime_type = "application/zip"
-        data = zip_buffer.getvalue()
-        clean_name = "verified_docs.zip"
+            for n, c in st.session_state.processed_data.items():
+                zf.writestr(os.path.splitext(n)[0]+".md", c)
+        st.download_button("📥 Download All Results", zip_buffer.getvalue(), "final_docs.zip", "application/zip")
 
-    if location == "sidebar":
-        st.sidebar.download_button(btn_label, data, clean_name, mime_type)
-    else:
-        st.download_button(btn_label, data, clean_name, mime_type, type="primary", use_container_width=True)
+tab1, tab2 = st.tabs(["📤 Upload & Process", "🔍 Manual Review Queue"])
 
-with st.sidebar:
-    st.header("🔑 Credentials")
-    llama_key = st.text_input("LlamaCloud Key", type="password")
-    google_key = st.text_input("Gemini Key", type="password")
-    mode = st.selectbox("Scenario", list(PROMPT_LIBRARY.keys()))
-    st.divider()
-    render_download_button("sidebar")
-
-st.title("👁️ Contextual Forensic Digitizer")
-st.markdown("### Uses full-document context to repair localized errors.")
-
-files = st.file_uploader("Upload Files", accept_multiple_files=True)
-
-if st.button("🚀 Start Contextual Analysis"):
-    if not llama_key or not google_key: st.error("Keys required"); st.stop()
-    if not files: st.warning("Upload a file"); st.stop()
-
-    temp_dir = tempfile.mkdtemp()
-    progress_bar = st.progress(0)
-    
-    st.divider()
-    live_window = st.empty()
-    st.session_state.processed_data = {}
-    
-    for i, f in enumerate(files):
-        path = os.path.join(temp_dir, f.name)
-        with open(path, "wb") as file: file.write(f.getbuffer())
+with tab1:
+    files = st.file_uploader("Upload Scans", accept_multiple_files=True)
+    if st.button("🚀 Start Analysis"):
+        if not lk or not gk:
+            st.error("Please provide both API keys in the sidebar.")
+            st.stop()
+            
+        live_window = st.empty()
+        for f in files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(f.getbuffer())
+                path = tmp.name
+            
+            res, manual, logs = run_pipeline(path, lk, gk, live_window)
+            
+            if manual:
+                st.session_state.review_queue.append({"name": f.name, "text": res, "items": manual})
+                st.warning(f"⚠️ {f.name} requires manual review. Check the 'Manual Review Queue' tab.")
+            else:
+                st.session_state.processed_data[f.name] = res
+                st.success(f"✅ {f.name} processed successfully!")
         
-        try:
-            final_text, file_logs = process_file(path, llama_key, google_key, live_window)
-            final_text = clean_final_output(final_text)
-            st.session_state.processed_data[f.name] = final_text
-            os.remove(path)
-            
-            with st.expander(f"📜 Log: {f.name}", expanded=False):
-                for log in file_logs:
-                    if "CONTEXT" in log: st.markdown(f":blue[{log}]")
-                    elif "VISION" in log: st.markdown(f":green[{log}]")
-                    else: st.text(log)
-                    
-        except Exception as e:
-            st.error(f"Error {f.name}: {e}")
-            
-        progress_bar.progress((i+1)/len(files))
+        if not st.session_state.review_queue:
+            st.success("Batch Complete! All files processed automatically.")
+        else:
+            st.info("Batch Complete. Some files require manual review.")
 
-    live_window.empty()
-    st.divider()
-    st.success("✅ Analysis Complete")
-    
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c2:
-        render_download_button("main")
-    st.balloons()
+with tab2:
+    if st.session_state.review_queue:
+        for idx, file_review in enumerate(st.session_state.review_queue):
+            st.subheader(f"Reviewing: {file_review['name']}")
+            for i, item in enumerate(file_review['items']):
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    st.image(item['crop'], caption="Visual Proof")
+                with col2:
+                    st.write(f"**AI Suspect:** `{item['word']}`")
+                    st.write(f"**Judge Verdict:** `{item['verdict']}`")
+                    user_fix = st.text_input(f"Correct this word (or leave as is):", value=item['verdict'], key=f"fix_{idx}_{i}")
+                    if st.button(f"Apply Correction", key=f"btn_{idx}_{i}"):
+                        file_review['text'] = safe_replace_entity(file_review['text'], item['word'], user_fix)
+                        st.success("Updated!")
+            
+            if st.button(f"✅ Finalize {file_review['name']}", key=f"fin_{idx}"):
+                st.session_state.processed_data[file_review['name']] = file_review['text']
+                st.session_state.review_queue.pop(idx)
+                st.rerun()
+    else:
+        st.info("No words flagged for manual review.")
